@@ -83,7 +83,8 @@ def lookup_code_links(http: HttpClient, *, now: datetime | None = None) -> Mappi
     """Read the official BSE old-code to new-code table and return the verified links.
 
     The parser finds the table whose header contains `旧代码` and `新代码`, then binds
-    the exact six-digit values in each real row. Both codes must be distinct
+    the exact six-digit values in each real row. Footnote rows (see
+    is_footnote_row) are skipped. Both codes must be distinct
     six-digit values; an old code may map to only one new code and the reverse. A
     malformed or conflicting table returns state `failed` with no links. The
     `上市日期` column stays labelled text inside `cells`; `effective_date` is None.
@@ -153,8 +154,12 @@ def parse_mapping_table(text: str, url: str, now: datetime) -> tuple[list[CodeLi
         return fail("the mapping table uses unsupported cell spans", headers)
     old_col, new_col = headers.index("旧代码"), headers.index("新代码")
     rows = [r for r in table.rows[header_index + 1:] if any(cell.strip() for cell in r)]
+    notes = [r[0].strip() for r in rows if is_footnote_row(r)]
+    rows = [r for r in rows if not is_footnote_row(r)]
     if len(rows) > MAX_MAPPINGS:
         return fail(f"the mapping table has more than {MAX_MAPPINGS} rows", headers)
+    if len(notes) > 5:
+        return fail("the mapping table has more than five footnote rows", headers)
     forward: dict[str, str] = {}
     backward: dict[str, str] = {}
     links: list[CodeLink] = []
@@ -175,6 +180,19 @@ def parse_mapping_table(text: str, url: str, now: datetime) -> tuple[list[CodeLi
                               headers=tuple(headers), cells=cells, effective_date=None, evidence_hash=evidence_hash,
                               first_seen=now, last_seen=now))
     return sorted(links, key=lambda link: link.from_symbol.code), headers, None
+
+
+def is_footnote_row(row: list[str]) -> bool:
+    """Report whether a mapping-table row is a footnote rather than a mapping and return the decision.
+
+    The live BSE table ends with a row whose first cell starts with `注` (a note
+    about listing dates) and whose other cells are empty. Only that exact shape is
+    a footnote; any other row must be a valid mapping.
+
+    :param row: list[str]; table row cells.
+    return footnote: bool; True for a footnote row.
+    """
+    return bool(row) and row[0].strip().startswith("注") and all(not cell.strip() for cell in row[1:])
 
 
 def resolve_symbols(symbol: Symbol, links: Sequence[CodeLink]) -> tuple[Symbol, ...]:

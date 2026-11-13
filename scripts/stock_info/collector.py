@@ -12,12 +12,13 @@ import logging
 import time
 import uuid
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Callable
 
 from .filings import discover_filings, read_filing
 from .providers import (
-    CacheState, CheckKey, CheckSummary, CollectRequest, CommandResult, Coverage, DateRange, FilingRef, Group,
+    CacheState, CheckKey, CheckSummary, CollectRequest, CommandResult, Coverage, DateRange, FilingRef, FilingResult,
+    Group,
     HttpClient, InputError, Interval, Issue, QueryRequest, StatementKind, Stats, Symbol, UtcClock,
     compute_china_day, convert_to_json, fetch_prices, fetch_statements, make_issue,
 )
@@ -355,7 +356,7 @@ def _collect_documents(run: _Run, state: CacheState, references: list[FilingRef]
             pending.append(reference.uri)
             continue
         attempted += 1
-        summary = run.run_task(key, None, lambda r=reference: read_filing(run.http, r))
+        summary = run.run_task(key, None, lambda r=reference: apply_sina_coverage(run, read_filing(run.http, r)))
         if summary is None or not isinstance(summary.metadata, dict):
             continue
         html_succeeded = summary.coverage.row_count > 0
@@ -376,6 +377,54 @@ def _collect_documents(run: _Run, state: CacheState, references: list[FilingRef]
         run.issues.append(make_issue("work_limit", f"{len(pending)} filing documents remain pending after the"
                                      f" {MAX_DOCUMENTS}-document limit; first {pending[0]}", "filing",
                                      severity="warning", provider="filing", retryable=True))
+
+
+def apply_sina_coverage(run: _Run, result: FilingResult) -> FilingResult:
+    """Downgrade rejected consolidated filing tables that Sina already covers and return the result.
+
+    A rejected table is covered when its scope is consolidated, its header has at
+    least one explicit period, and a stored Sina consolidated statement of the same
+    kind exists for every one of those periods. The matching
+    `ambiguous_statement_table` issues (identified by `table at <locator> `) become
+    warnings with an explanatory suffix. When every rejected table is covered and
+    the document produced statements, the document state becomes `succeeded`; its
+    extraction `status` and `unparsed_locators` stay unchanged. Parent-company
+    tables are never covered, because Sina has no parent-company scope. Covered
+    locators are listed in `metadata["sina_covered_locators"]`.
+
+    :param run: _Run; run state with the store and clock.
+    :param result: FilingResult; outcome of read_filing.
+    return result: FilingResult; possibly adjusted outcome.
+    """
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    rejected = metadata.get("rejected_tables") or []
+    if not rejected or result.reference is None:
+        return result
+    covered: list[str] = []
+    for table in rejected:
+        dates = table.get("report_dates") or []
+        if table.get("scope") != "consolidated" or not dates:
+            continue
+        span = DateRange(date.fromisoformat(dates[0]), date.fromisoformat(dates[-1]))
+        query = QueryRequest(symbol=result.reference.symbol, span=span, dataset="statements", provider="sina",
+                             scope="consolidated", kind=table["kind"], limit=2000)
+        page = run.store.query(query, run.clock(), symbols=(result.reference.symbol,))
+        found = {str(r["data"]["report_date"]) for g in page["groups"] for r in g["records"]}
+        if set(dates) <= found:
+            covered.append(table["locator"])
+    if not covered:
+        return result
+    issues = []
+    for issue in result.issues:
+        if issue.code == "ambiguous_statement_table" and any(f"table at {loc} " in issue.message for loc in covered):
+            issue = replace(issue, severity="warning", message=issue.message
+                            + "; Sina's structured consolidated statement covers these periods")
+        issues.append(issue)
+    state = result.state
+    if len(covered) == len(rejected) and result.statements and state == "partial":
+        state = "succeeded"
+    return replace(result, issues=tuple(issues), state=state, coverage=replace(result.coverage, traversal=state),
+                   metadata={**metadata, "sina_covered_locators": covered})
 
 
 def _report_parent_gaps(run: _Run, symbols: tuple[Symbol, ...], candidates: list[FilingRef]) -> None:

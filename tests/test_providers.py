@@ -215,6 +215,7 @@ BSE_PAGE = """<html><head><meta charset="utf-8"></head><body><table>
 <tr><th>序号</th><th>证券简称</th><th>上市日期</th><th>旧代码</th><th>新代码</th></tr>
 <tr><td>1</td><td>五新隧装</td><td>2021-11-15</td><td>832000</td><td>920000</td></tr>
 <tr><td>2</td><td>某公司</td><td>2022-01-01</td><td>832982</td><td>920982</td></tr>
+<tr><td>注：上表中上市日期字段为其在原精选层的挂牌日期。</td><td></td><td></td><td></td><td></td></tr>
 </table></body></html>"""
 
 
@@ -472,7 +473,9 @@ class MappingTests(unittest.TestCase):
 
     def test_rejects_malformed_and_conflicting_tables(self) -> None:
         """Non-six-digit codes and conflicting rows produce a failed lookup with no links."""
-        for bad in (BSE_PAGE.replace("920982", "92098"), BSE_PAGE.replace("832982", "832000")):
+        footnote_with_code = BSE_PAGE.replace("<td></td><td></td><td></td><td></td></tr>",
+                                              "<td></td><td></td><td>832001</td><td></td></tr>")
+        for bad in (BSE_PAGE.replace("920982", "92098"), BSE_PAGE.replace("832982", "832000"), footnote_with_code):
             session = FakeSession([(lambda u: True, html_reply(bad))])
             result = lookup_code_links(make_client(session))
             self.assertEqual((result.state, result.links), ("failed", ()))

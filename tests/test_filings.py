@@ -275,6 +275,12 @@ class LiveShapeTests(unittest.TestCase):
                          (date(2025, 9, 30), "year_to_date"))
         self.assertEqual(parse_column_header("2025年第一季度", "income"), (date(2025, 3, 31), "year_to_date"))
         self.assertEqual(parse_column_header("2025年第三季度", "income"), (None, None))
+        annual = date(2025, 12, 31)
+        self.assertEqual(parse_column_header("2024年", "income", annual), (date(2024, 12, 31), "annual"))
+        self.assertEqual(parse_column_header("2025年", "balance", annual), (None, None))
+        self.assertEqual(parse_column_header("2025年", "income", date(2025, 6, 30)), (None, None))
+        self.assertEqual(parse_column_header("2025年", "income"), (None, None))
+        self.assertEqual(parse_column_header("2022年", "income", annual), (None, None))
 
 
 class PdfFilingTests(unittest.TestCase):

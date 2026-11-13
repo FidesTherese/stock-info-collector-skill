@@ -276,6 +276,9 @@ class Extraction:
     :param issues: list[Issue]; warnings and errors.
     :param headings: list[str]; statement headings that were found.
     :param unparsed: list[str]; locators of rejected tables.
+    :param rejected: list[dict[str, Any]]; rejected statement tables; each entry has `locator: str`,
+        `scope: str`, `kind: str`, and `report_dates: list[str]` (ISO dates of the explicit header
+        columns, possibly empty).
     return instance: Extraction; mutable outcome.
     """
 
@@ -283,6 +286,7 @@ class Extraction:
     issues: list[Issue] = field(default_factory=list)
     headings: list[str] = field(default_factory=list)
     unparsed: list[str] = field(default_factory=list)
+    rejected: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -304,18 +308,22 @@ class ColumnSpec:
     from_title: bool = False
 
 
-def parse_column_header(header: str, kind: StatementKind) -> tuple[date | None, str | None]:
+def parse_column_header(header: str, kind: StatementKind,
+                        title_date: date | None = None) -> tuple[date | None, str | None]:
     """Read an explicit period from a column header and return (date, period basis).
 
     A full date is `instant` for balance sheets and `period_end` otherwise;
     `YYYY年度` is `annual`. These are `year_to_date`: `YYYY年1-N月`, a year with a
     bracketed `(1-N月)` such as `2025年前三季度（1-9月）`, `YYYY年半年度` (to June 30),
     and `YYYY年第一季度` (to March 31). A bare third-quarter label is not
-    year-to-date and is not recognized. Headers without an explicit period return
-    (None, None).
+    year-to-date and is not recognized. A header that is exactly `YYYY年` (used by
+    Beijing annual reports) is `annual` only for income and cash-flow statements,
+    only when the document's title period is December 31, and only for that year
+    or the year before. Headers without an explicit period return (None, None).
 
     :param header: str; column header text.
     :param kind: StatementKind; statement kind.
+    :param title_date: date | None; candidate period from the document title, or None.
     return period: tuple[date | None, str | None]; period end and basis.
     """
     compact = re.sub(r"\s+", "", header)
@@ -342,6 +350,10 @@ def parse_column_header(header: str, kind: StatementKind) -> tuple[date | None, 
     match = _ANNUAL.search(compact)
     if match:
         return date(int(match.group(1)), 12, 31), "annual"
+    bare = re.fullmatch(r"(\d{4})年", compact)
+    if (bare and kind != "balance" and title_date is not None and (title_date.month, title_date.day) == (12, 31)
+            and int(bare.group(1)) in (title_date.year, title_date.year - 1)):
+        return date(int(bare.group(1)), 12, 31), "annual"
     return None, None
 
 
@@ -376,7 +388,7 @@ def plan_columns(header: list[str], kind: StatementKind, title_date: date | None
     """
     columns: list[ColumnSpec] = []
     for index, cell in enumerate(header[1:], start=1):
-        day, basis = parse_column_header(cell, kind)
+        day, basis = parse_column_header(cell, kind, title_date)
         if day is not None and basis is not None:
             columns.append(ColumnSpec(index, day, basis, cell))
     if not columns and title_date is not None:
@@ -398,6 +410,27 @@ def plan_columns(header: list[str], kind: StatementKind, title_date: date | None
                                  " date", "filing", symbol=reference.symbol, provider="filing", url=reference.uri))
         return None
     return columns
+
+
+def record_rejection(extraction: Extraction, heading: tuple[str, str, StatementKind], rows: list[list[str]],
+                     locator: str, title_date: date | None = None) -> None:
+    """Record which statement a rejected table held so that the collector can judge its impact.
+
+    The function reads the explicit period of each header column (the first row
+    whose first cell contains `项目`). Columns without an explicit period are
+    ignored, so `report_dates` may be empty.
+
+    :param extraction: Extraction; outcome to append to.
+    :param heading: tuple[str, str, StatementKind]; (heading text, scope, kind) of the table.
+    :param rows: list[list[str]]; rows of the rejected table (first piece for joined tables).
+    :param locator: str; locator used in the rejection issue.
+    :param title_date: date | None; candidate period from the document title.
+    return None: None; no value is returned.
+    """
+    _text, scope, kind = heading
+    header = next((r for r in rows if r and "项目" in re.sub(r"\s+", "", r[0])), [])
+    dates = sorted({d.isoformat() for d in (parse_column_header(c, kind, title_date)[0] for c in header[1:]) if d})
+    extraction.rejected.append({"locator": locator, "scope": scope, "kind": kind, "report_dates": dates})
 
 
 def build_table_statements(rows: list[list[str]], heading: tuple[str, str, StatementKind], unit: str | None,
@@ -439,6 +472,7 @@ def build_table_statements(rows: list[list[str]], heading: tuple[str, str, State
                                             " match its header", "filing", symbol=reference.symbol,
                                             provider="filing", url=reference.uri))
         extraction.unparsed.append(locator)
+        record_rejection(extraction, heading, rows, locator, reference.report_date)
         return False
     ambiguous = 0
     for column in columns:
@@ -526,6 +560,7 @@ def extract_statements(blocks: list[TextBlock], reference: FilingRef, fmt: str) 
                                                 " unsupported spans, nesting, or an unclear continuation", "filing",
                                                 symbol=reference.symbol, provider="filing", url=reference.uri))
             extraction.unparsed.append(locator)
+            record_rejection(extraction, heading, rows, locator, reference.report_date)
             continue
         unit_match = _UNIT.search(context)
         currency_match = _CURRENCY.search(context)
@@ -619,6 +654,7 @@ def read_filing(http: HttpClient, reference: FilingRef, *, monotonic: Callable[[
     in `metadata["attachments"]` for the caller to schedule.
 
     Output metadata: `headings: list[str]`, `unparsed_locators: list[str]`,
+    `rejected_tables: list[{locator, scope, kind, report_dates}]` (see Extraction),
     `attachments: list[FilingRef as JSON]`, `matched_code: str | None`.
 
     :param http: HttpClient; bounded client.
@@ -684,7 +720,8 @@ def read_filing(http: HttpClient, reference: FilingRef, *, monotonic: Callable[[
                         observed_start=dates[0] if dates else None, observed_end=dates[-1] if dates else None,
                         row_count=len(extraction.statements), traversal=state)  # type: ignore[arg-type]
     metadata = {"headings": extraction.headings, "unparsed_locators": extraction.unparsed,
-                "attachments": convert_to_json(attachments), "matched_code": matched}
+                "rejected_tables": extraction.rejected, "attachments": convert_to_json(attachments),
+                "matched_code": matched}
     return FilingResult(state=state, coverage=coverage, requests=requests, issues=tuple(extraction.issues),  # type: ignore[arg-type]
                         metadata=metadata, reference=reference, format=fmt, body_sha256=body_hash,  # type: ignore[arg-type]
                         status=status, statements=tuple(extraction.statements))  # type: ignore[arg-type]

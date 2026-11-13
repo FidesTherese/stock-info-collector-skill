@@ -76,7 +76,7 @@ The tests use fake HTTP responses and temporary databases. They never contact a 
 - Scanned (image-only) PDF filings are reported as unreadable; there is no OCR.
 - Shanghai and Shenzhen code changes are not resolved, because no official mapping source is configured.
 - Text extraction from real report PDFs usually rejects the tables as ambiguous. The collector therefore reads a PDF attachment only when its HTML page yielded no statement.
-- A statement whose page-break pieces do not line up is rejected rather than saved partially, and the collect then ends with status `partial`.
-- The sources were checked live once on 2026-11-13. Their page formats can change without notice.
+- A statement whose page-break pieces do not line up is rejected rather than saved partially. A rejected consolidated statement is only a warning when Sina's structured data covers the same periods; a rejected parent-company statement makes the collect `partial`.
+- The sources were checked live on 2026-11-13 for one Shanghai, one Shenzhen, and one Beijing symbol. Their page formats can change without notice.
 
 [↑ Back to Table of Contents](#table-of-contents)

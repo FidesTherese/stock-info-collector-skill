@@ -191,6 +191,41 @@ class AttachmentTests(CollectorTestCase):
         self.assertTrue(any(u.endswith(".PDF") for u in session.calls))
 
 
+class SinaCoverageTests(CollectorTestCase):
+    """Check how rejected filing tables affect the run when Sina covers them."""
+
+    BAD_PIECE = "<table><tr><td>存货</td><td>1</td><td>2</td></tr></table>"
+
+    def run_with_detail(self, html: str) -> dict:
+        """Run a collect whose annual report page is the given HTML and return the envelope.
+
+        :param html: str; detail page HTML.
+        return envelope: dict; command result.
+        """
+        session = build_world()
+        session.routes = [r for r in session.routes if not r[0]("https://x/vCB_AllBulletinDetail")]
+        session.add(lambda u: "vCB_AllBulletinDetail" in u, html_reply(html))
+        return self.run_collect(session)
+
+    def test_covered_consolidated_rejection_is_a_warning(self) -> None:
+        """A rejected consolidated table covered by Sina becomes a warning and the run is ok."""
+        html = DETAIL.replace("<td>5.00</td></tr></table>", "<td>5.00</td></tr></table>" + self.BAD_PIECE, 1)
+        result = self.run_with_detail(html)
+        rejected = [i for i in result["issues"] if i["code"] == "ambiguous_statement_table"]
+        self.assertEqual([i["severity"] for i in rejected], ["warning"])
+        self.assertIn("Sina", rejected[0]["message"])
+        self.assertEqual(result["status"], "ok", result["issues"])
+
+    def test_parent_rejection_stays_an_error(self) -> None:
+        """A rejected parent-company table is never covered by Sina and keeps the run partial."""
+        marker = "<td>(10.00)</td><td>--</td></tr></table>"
+        result = self.run_with_detail(DETAIL.replace(marker, marker + self.BAD_PIECE.replace(
+            "<td>2</td>", "<td>2</td><td>3</td><td>4</td>"), 1))
+        rejected = [i for i in result["issues"] if i["code"] == "ambiguous_statement_table"]
+        self.assertEqual([i["severity"] for i in rejected], ["error"])
+        self.assertEqual(result["status"], "partial")
+
+
 class FallbackTests(CollectorTestCase):
     """Check the separate Tencent task after a whole Eastmoney failure."""
 
