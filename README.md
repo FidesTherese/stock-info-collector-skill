@@ -9,6 +9,7 @@
 - [Run the Tests](#run-the-tests)
 - [Where Things Are](#where-things-are)
 - [Known Limits](#known-limits)
+- [License](#license)
 
 ## What This Project Does
 
@@ -29,8 +30,10 @@ The project needs Python 3.11 or newer. On Windows 11, run these commands in Pow
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python -m pip install "curl_cffi>=0.15,<0.16" "pypdf>=7.0.1,<8"
+.\.venv\Scripts\python -m pip install -r requirements.txt
 ```
+
+On macOS or Linux, use `python3 -m venv .venv` and `.venv/bin/python -m pip install -r requirements.txt`.
 
 No API key or configuration file is needed.
 
@@ -65,7 +68,8 @@ The tests use fake HTTP responses and temporary databases. They never contact a 
 - [`scripts/`](scripts/README.md) contains the command-line entry point and the `stock_info` package.
 - [`tests/`](tests/README.md) contains the automated tests.
 - [`data/`](data/README.md) holds the local database, which Git does not track.
-- [`doc/`](doc/README.md) contains the specification and the detailed technical design.
+- [`requirements.txt`](requirements.txt) lists the two runtime dependencies.
+- `doc/` holds internal design records for the project's developers; they are not part of the public repository.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -78,5 +82,11 @@ The tests use fake HTTP responses and temporary databases. They never contact a 
 - Text extraction from real report PDFs usually rejects the tables as ambiguous. The collector therefore reads a PDF attachment only when its HTML page yielded no statement.
 - A statement whose page-break pieces do not line up is rejected rather than saved partially. A rejected consolidated statement is only a warning when Sina's structured data covers the same periods; a rejected parent-company statement makes the collect `partial`.
 - The sources were checked live on 2026-11-13 for one Shanghai, one Shenzhen, and one Beijing symbol. Their page formats can change without notice.
+
+[↑ Back to Table of Contents](#table-of-contents)
+
+## License
+
+The code is released into the public domain under [The Unlicense](LICENSE). Anyone may copy, modify, publish, or sell it for any purpose, without attribution. The license covers only the code. It does not cover data that the collector downloads, whose reuse conditions are not established.
 
 [↑ Back to Table of Contents](#table-of-contents)

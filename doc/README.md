@@ -7,6 +7,6 @@
 
 ## Purpose
 
-This directory contains the design records for the project. The [specification](spec-stock-info-collector.md) explains what the skill does and why. The [detailed technical design](dtd-stock-info-collector.md) is the implementation contract: interfaces, schemas, source contracts, and limits. The parent [README](../README.md) explains how to set up and run the project.
+This directory holds internal design records for the project's developers: the specification (`spec-stock-info-collector.md`) and the detailed technical design (`dtd-stock-info-collector.md`). They are intentionally not published with the public repository. Users need only the parent [README](../README.md) and [`SKILL.md`](../SKILL.md).
 
 [↑ Back to Table of Contents](#table-of-contents)
