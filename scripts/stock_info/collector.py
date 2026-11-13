@@ -325,7 +325,12 @@ def _is_document_due(state: CacheState, key: CheckKey, now: datetime, refresh: b
 
 
 def _collect_documents(run: _Run, state: CacheState, references: list[FilingRef]) -> None:
-    """Read due filing documents and their PDF attachments, at most 24 per run, and record pending work.
+    """Read due filing documents and, when needed, their PDF attachments, at most 24 per run.
+
+    A PDF attachment is read only when its HTML page yielded no statement. When
+    the HTML page did yield statements, the PDF repeats the same report, so it is
+    skipped and one `pdf_attachment_skipped` warning lists how many were skipped.
+    Documents beyond the 24-document limit are recorded as pending work.
 
     :param run: _Run; run state.
     :param state: CacheState; stored checks.
@@ -340,6 +345,7 @@ def _collect_documents(run: _Run, state: CacheState, references: list[FilingRef]
             queue.append(reference)
     attempted = 0
     pending: list[str] = []
+    skipped: list[str] = []
     while queue:
         reference = queue.pop(0)
         key = CheckKey(reference.symbol.symbol_id, "filing", "filing", "none", reference.uri)
@@ -352,11 +358,19 @@ def _collect_documents(run: _Run, state: CacheState, references: list[FilingRef]
         summary = run.run_task(key, None, lambda r=reference: read_filing(run.http, r))
         if summary is None or not isinstance(summary.metadata, dict):
             continue
+        html_succeeded = summary.coverage.row_count > 0
         for item in summary.metadata.get("attachments") or []:
             uri = item.get("uri")
             if uri and uri not in seen:
                 seen.add(uri)
-                queue.append(replace(reference, uri=uri))
+                if html_succeeded:
+                    skipped.append(uri)
+                else:
+                    queue.append(replace(reference, uri=uri))
+    if skipped:
+        run.issues.append(make_issue("pdf_attachment_skipped", f"{len(skipped)} PDF attachments were not read because"
+                                     f" their HTML pages already yielded statements; first {skipped[0]}", "filing",
+                                     severity="warning", provider="filing"))
     if pending:
         run.pending.extend(pending)
         run.issues.append(make_issue("work_limit", f"{len(pending)} filing documents remain pending after the"

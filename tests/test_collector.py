@@ -165,6 +165,32 @@ class CollectFlowTests(CollectorTestCase):
         self.assertIn("missing_parent_statements", [i["code"] for i in result["issues"]])
 
 
+class AttachmentTests(CollectorTestCase):
+    """Check when PDF attachments of HTML reports are read."""
+
+    ATTACHMENT = '<p><a href="http://file.finance.sina.com.cn/MRGG/2026/111.PDF">下载公告</a></p></body></html>'
+
+    def test_pdf_skipped_when_html_yields_statements(self) -> None:
+        """A parsed HTML report does not trigger a download of its PDF attachment."""
+        session = build_world()
+        session.routes = [r for r in session.routes if not r[0]("https://x/vCB_AllBulletinDetail")]
+        session.add(lambda u: "vCB_AllBulletinDetail" in u,
+                    html_reply(DETAIL.replace("</body></html>", self.ATTACHMENT)))
+        result = self.run_collect(session)
+        self.assertFalse(any(u.endswith(".PDF") for u in session.calls))
+        self.assertIn("pdf_attachment_skipped", [i["code"] for i in result["issues"]])
+        self.assertEqual(result["status"], "ok", result["issues"])
+
+    def test_pdf_read_when_html_has_no_statements(self) -> None:
+        """An HTML page without statements makes the collector read its PDF attachment."""
+        session = build_world()
+        session.routes = [r for r in session.routes if not r[0]("https://x/vCB_AllBulletinDetail")]
+        empty = "<html><body><p>证券代码：600519</p>" + self.ATTACHMENT
+        session.add(lambda u: "vCB_AllBulletinDetail" in u, html_reply(empty))
+        self.run_collect(session)
+        self.assertTrue(any(u.endswith(".PDF") for u in session.calls))
+
+
 class FallbackTests(CollectorTestCase):
     """Check the separate Tencent task after a whole Eastmoney failure."""
 
