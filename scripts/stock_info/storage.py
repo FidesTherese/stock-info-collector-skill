@@ -809,8 +809,10 @@ class Store:
                                now: datetime) -> list[tuple[Group, Callable[[], Iterator[OutputRecord]] | None]]:
         """Plan one group per statement kind and provider (Sina and filings) for one symbol.
 
-        Sina groups select the latest valid check. Filing groups aggregate every
-        valid filing document check and have no single selected check.
+        Sina groups select the latest valid check. Filing groups aggregate filing
+        documents and have no single selected check: `latest` uses only the latest
+        valid read of each document URI (so a re-read supersedes records whose
+        locators changed), while `all` returns every observed record.
 
         :param symbol: Symbol; symbol.
         :param request: QueryRequest; validated query.
@@ -835,6 +837,11 @@ class Store:
                     selected, reason = None, "all_filing_documents" if valid else "no_usable_check"
                     check_sql = ("c.symbol_id=? AND c.provider='filing' AND c.dataset='filing' AND s.kind=?",
                                  [symbol.symbol_id, kind])
+                    if request.versions == "latest":
+                        latest_ids = sorted({max(c.check_id for c in valid if c.key.resource == uri)
+                                             for uri in {c.key.resource for c in valid}})
+                        marks = ",".join("?" for _ in latest_ids) or "NULL"
+                        check_sql = (check_sql[0] + f" AND c.id IN ({marks})", [*check_sql[1], *latest_ids])
                 group = self._describe_group(symbol.symbol_id, provider, kind, "none", "", checks, selected, reason,
                                              request.span, now)
                 if provider == "filing" and valid:

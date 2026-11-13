@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from stock_info.filings import (  # noqa: E402
-    classify_report_title, convert_pdf_text, discover_filings, read_filing, read_pdf_blocks,
+    classify_report_title, convert_pdf_text, discover_filings, parse_column_header, read_filing, read_pdf_blocks,
 )
 from stock_info.providers import DateRange, FilingRef, Symbol  # noqa: E402
 from test_providers import FakeSession, html_reply, make_client  # noqa: E402
@@ -209,6 +209,72 @@ class HtmlFilingTests(unittest.TestCase):
         far = DETAIL_HTML.replace("<p>母公司利润表</p>", "<p>母公司利润表</p><p>" + "说明" * 600 + "</p>")
         result = self.read(far)
         self.assertFalse(any(s.kind == "income" for s in result.statements))
+
+
+LAYOUT_INDEX = """<html><head><meta charset="gbk"></head><body><table><tr><td>快速通道:</td><td>
+<div class="datelist"><ul>
+2026-04-17&nbsp;<a href='/corp/view/vCB_AllBulletinDetail.php?stockid=600519&id=12104117'>
+贵州茅台：2025年年度报告</a><br>
+2026-04-17&nbsp;<a href='/corp/view/vCB_AllBulletinDetail.php?stockid=600519&id=12104104'>
+贵州茅台：2025年年度报告(英文版)</a><br>
+</ul></div><table><tr><td>inner</td></tr></table></td></tr></table></body></html>"""
+ROW = '<tr><td rowspan="1" colspan="1">{0}</td><td></td><td>{1}</td><td>{2}</td></tr>'
+LAYOUT_DETAIL = (
+    '<html><body><table><tr><td>公告日期:2026-04-17</td></tr><tr><td><div id="content">'
+    "<p>公司代码：600519公司简称：贵州茅台</p>"
+    "<p>母公司资产负债表</p><p>2025年12月31日编制单位：贵州茅台酒股份有限公司</p><p>单位：元币种：人民币</p>"
+    '<div class="table-wrap"><table border="1"><tr><td>项目</td><td>附注</td><td>2025年12月31日</td>'
+    '<td>2024年12月31日</td></tr><tr><td rowspan="1" colspan="4">流动资产：</td></tr>'
+    + ROW.format("货币资金", "85,687,080,245.45", "77,252,079,198.82") + "</table></div><p>/</p>"
+    '<div class="table-wrap"><table border="1">' + ROW.format("资产总计", "195,350,142,529.19", "180,236,524,477.01")
+    + "</table></div><p>公司负责人：陈华</p>"
+    "<p>母公司利润表</p><p>单位：元币种：人民币</p>"
+    '<table border="1"><tr><td>项目</td><td>附注</td><td>2025年度</td><td>2024年度</td></tr>'
+    + ROW.format("一、营业收入", "98,318,530,088.73", "94,526,736,836.41") + "</table><p>/</p>"
+    '<table border="1"><tr><td>号填列）</td><td></td><td></td><td></td><td></td></tr></table>'
+    "</div></td></tr></table></body></html>")
+
+
+class LiveShapeTests(unittest.TestCase):
+    """Reproduce page shapes observed on live Sina pages on 2026-11-13."""
+
+    def test_links_inside_layout_tables_are_discovered(self) -> None:
+        """Report links nested in a layout table are found and English versions are skipped."""
+        session = FakeSession([(lambda u: u.endswith("ndbg.phtml"), html_reply(LAYOUT_INDEX, "gbk")),
+                               (lambda u: True, html_reply("<html><body></body></html>"))])
+        result = discover_filings(make_client(session), SH, DateRange(date(2025, 1, 1), date(2025, 12, 31)))
+        self.assertEqual([c.uri.rsplit("=", 1)[1] for c in result.candidates], ["12104117"])
+        self.assertEqual(result.candidates[0].publication_date, date(2026, 4, 17))
+        self.assertEqual(result.metadata["skipped_titles"], 1)
+
+    def test_layout_page_label_rows_and_continuations(self) -> None:
+        """A page split joins across `/` markers; an unjoinable continuation rejects its statement."""
+        session = FakeSession([(lambda u: True, html_reply(LAYOUT_DETAIL))])
+        result = read_filing(make_client(session), reference(DETAIL_URL.replace("300059", "600519"), SH))
+        self.assertEqual(result.status, "partial")
+        balance = [s for s in result.statements if s.kind == "balance"]
+        self.assertEqual(sorted(s.report_date.isoformat() for s in balance), ["2024-12-31", "2025-12-31"])
+        latest = next(s for s in balance if s.report_date == date(2025, 12, 31))
+        self.assertEqual([(i.item_title, i.value_decimal) for i in latest.items],
+                         [("流动资产：", None), ("货币资金", "85687080245.45"), ("资产总计", "195350142529.19")])
+        self.assertFalse(any(s.kind == "income" for s in result.statements))
+        codes = [i.code for i in result.issues]
+        self.assertIn("table_continuation_merged", codes)
+        self.assertIn("ambiguous_statement_table", codes)
+        self.assertEqual(result.metadata["matched_code"], "600519")
+
+    def test_adjacent_continuation_and_period_headers(self) -> None:
+        """Adjacent header-less tables are joined; half-year and nine-month headers are year-to-date."""
+        html = LAYOUT_DETAIL.replace("</table></div><p>/</p>", "</table></div>", 1)
+        session = FakeSession([(lambda u: True, html_reply(html))])
+        result = read_filing(make_client(session), reference(DETAIL_URL.replace("300059", "600519"), SH))
+        latest = next(s for s in result.statements if s.report_date == date(2025, 12, 31))
+        self.assertEqual(latest.items[-1].item_title, "资产总计")
+        self.assertEqual(parse_column_header("2025年半年度", "income"), (date(2025, 6, 30), "year_to_date"))
+        self.assertEqual(parse_column_header("2025年前三季度（1-9月）", "cash_flow"),
+                         (date(2025, 9, 30), "year_to_date"))
+        self.assertEqual(parse_column_header("2025年第一季度", "income"), (date(2025, 3, 31), "year_to_date"))
+        self.assertEqual(parse_column_header("2025年第三季度", "income"), (None, None))
 
 
 class PdfFilingTests(unittest.TestCase):

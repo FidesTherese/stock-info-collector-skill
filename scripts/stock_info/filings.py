@@ -56,9 +56,12 @@ _HEADING = re.compile(r"(母公司|合并)\s*(资产负债表|利润表|现金�
 _KIND_BY_TITLE: dict[str, StatementKind] = {"资产负债表": "balance", "利润表": "income", "现金流量表": "cash_flow"}
 _UNIT = re.compile(r"单位\s*[:：]\s*(百万元|千元|万元|亿元|元)")
 _CURRENCY = re.compile(r"币种\s*[:：]\s*([一-鿿A-Za-z]+)")
-_CODE_LABEL = re.compile(r"(?:股票代码|证券代码)\s*[:：]?\s*(\d{6})")
+_CODE_LABEL = re.compile(r"(?:股票代码|证券代码|公司代码)\s*[:：]?\s*(\d{6})")
 _FULL_DATE = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日|(\d{4})-(\d{2})-(\d{2})")
 _YEAR_TO_DATE = re.compile(r"(\d{4})\s*年\s*1\s*[-—–~至]\s*(\d{1,2})\s*月")
+_YEAR_TO_DATE_NOTE = re.compile(r"(\d{4})年[^（(]*[（(]1[-—–~至](\d{1,2})月[）)]")
+_HALF_YEAR = re.compile(r"(\d{4})年(?:半年度|上半年)")
+_FIRST_QUARTER = re.compile(r"(\d{4})年(?:第一季度|一季度)")
 _ANNUAL = re.compile(r"(\d{4})\s*年度")
 _SKIP_WORDS = ("摘要", "英文", "English", "english", "预告", "快报", "聘", "提示性")
 
@@ -305,15 +308,25 @@ def parse_column_header(header: str, kind: StatementKind) -> tuple[date | None, 
     """Read an explicit period from a column header and return (date, period basis).
 
     A full date is `instant` for balance sheets and `period_end` otherwise;
-    `YYYY年度` is `annual`; `YYYY年1-N月` is `year_to_date`. Headers without an
-    explicit period return (None, None).
+    `YYYY年度` is `annual`. These are `year_to_date`: `YYYY年1-N月`, a year with a
+    bracketed `(1-N月)` such as `2025年前三季度（1-9月）`, `YYYY年半年度` (to June 30),
+    and `YYYY年第一季度` (to March 31). A bare third-quarter label is not
+    year-to-date and is not recognized. Headers without an explicit period return
+    (None, None).
 
     :param header: str; column header text.
     :param kind: StatementKind; statement kind.
     return period: tuple[date | None, str | None]; period end and basis.
     """
     compact = re.sub(r"\s+", "", header)
-    match = _YEAR_TO_DATE.search(compact)
+    match = _YEAR_TO_DATE.search(compact) or _YEAR_TO_DATE_NOTE.search(compact)
+    if match is None:
+        fixed = _HALF_YEAR.search(compact)
+        if fixed:
+            return date(int(fixed.group(1)), 6, 30), "year_to_date"
+        fixed = _FIRST_QUARTER.search(compact)
+        if fixed:
+            return date(int(fixed.group(1)), 3, 31), "year_to_date"
     if match:
         year, month = int(match.group(1)), int(match.group(2))
         if 1 <= month <= 12:
@@ -463,7 +476,10 @@ def extract_statements(blocks: list[TextBlock], reference: FilingRef, fmt: str) 
     A heading such as `母公司资产负债表` applies only to the next table and only when
     that table starts within 1,000 visible characters. The text between the
     heading and the table supplies the unit and currency. Tables with unsupported
-    geometry are rejected.
+    geometry are rejected. In HTML, a statement split at page breaks continues into
+    the following tables when they are adjacent or separated only by `/` page
+    markers, have the same column count, and do not start a new `项目` header (see
+    collect_html_continuation).
 
     :param blocks: list[TextBlock]; document blocks in reading order.
     :param reference: FilingRef; document reference.
@@ -474,7 +490,10 @@ def extract_statements(blocks: list[TextBlock], reference: FilingRef, fmt: str) 
     pending: tuple[str, str, StatementKind] | None = None
     distance = 0
     context = ""
-    for block in blocks:
+    index = 0
+    while index < len(blocks):
+        block = blocks[index]
+        index += 1
         if block.kind == "text":
             matches = list(_HEADING.finditer(block.text))
             if matches:
@@ -493,26 +512,80 @@ def extract_statements(blocks: list[TextBlock], reference: FilingRef, fmt: str) 
         if pending is None:
             continue
         heading, pending = pending, None
-        if not block.simple:
-            extraction.issues.append(make_issue("ambiguous_statement_table", f"table at {block.locator} uses"
-                                                " unsupported spans or nesting", "filing", symbol=reference.symbol,
-                                                provider="filing", url=reference.uri))
-            extraction.unparsed.append(block.locator)
+        rows, locator, index, simple = block.rows, block.locator, index, block.simple
+        if fmt == "html" and simple:
+            rows, pieces, index, simple = collect_html_continuation(blocks, index - 1)
+            if len(pieces) > 1:
+                locator = "+".join(pieces)
+                extraction.issues.append(make_issue(
+                    "table_continuation_merged", f"statement table {locator} was joined across"
+                    f" {len(pieces) - 1} page breaks", "filing", severity="warning", symbol=reference.symbol,
+                    provider="filing", url=reference.uri))
+        if not simple:
+            extraction.issues.append(make_issue("ambiguous_statement_table", f"table at {locator} uses"
+                                                " unsupported spans, nesting, or an unclear continuation", "filing",
+                                                symbol=reference.symbol, provider="filing", url=reference.uri))
+            extraction.unparsed.append(locator)
             continue
         unit_match = _UNIT.search(context)
         currency_match = _CURRENCY.search(context)
-        build_table_statements(block.rows, heading, unit_match.group(1) if unit_match else None,
-                               currency_match.group(1) if currency_match else None, reference, fmt, block.locator,
+        build_table_statements(rows, heading, unit_match.group(1) if unit_match else None,
+                               currency_match.group(1) if currency_match else None, reference, fmt, locator,
                                extraction)
     return extraction
+
+
+_PAGE_MARKER = re.compile(r"[\s/]*")
+
+
+def collect_html_continuation(blocks: list[TextBlock],
+                              start: int) -> tuple[list[list[str]], list[str], int, bool]:
+    """Join a statement table with its page-break continuations and return the combined rows.
+
+    Starting from the table at `start`, the function skips text blocks that contain
+    only `/` page markers (zero or more; live Sina pages use both forms). A table
+    that follows directly or after such markers and whose first cell
+    does not contain `项目` is a continuation: it is appended when it is simple and
+    every row has the first table's column count. Joining stops at the first other
+    block. When a continuation cannot be joined safely (different width or
+    unsupported geometry), the whole statement is reported as not simple, because
+    promoting only its first part would be a partial table.
+
+    :param blocks: list[TextBlock]; document blocks.
+    :param start: int; index of the first table.
+    return joined: tuple[list[list[str]], list[str], int, bool]; rows, piece locators, next block index, simple flag.
+    """
+    first = blocks[start]
+    width = len(first.rows[0]) if first.rows else 0
+    rows = [list(r) for r in first.rows]
+    pieces = [first.locator]
+    position = start + 1
+    while position < len(blocks):
+        probe = position
+        while probe < len(blocks) and blocks[probe].kind == "text" and _PAGE_MARKER.fullmatch(blocks[probe].text):
+            probe += 1
+        if probe >= len(blocks):
+            break
+        candidate = blocks[probe]
+        if candidate.kind != "table" or not candidate.rows:
+            break
+        if "项目" in re.sub(r"\s+", "", candidate.rows[0][0]):
+            break
+        if not candidate.simple or any(len(r) != width for r in candidate.rows):
+            return rows, pieces + [candidate.locator], probe + 1, False
+        rows.extend(list(r) for r in candidate.rows)
+        pieces.append(candidate.locator)
+        position = probe + 1
+    return rows, pieces, position, True
 
 
 def verify_identity(text: str, reference: FilingRef) -> tuple[bool, str | None]:
     """Check that a document names the requested code or a verified alias and return (ok, matched code).
 
-    A labelled `股票代码` or `证券代码` must equal an allowed code. Without a label,
-    a Sina detail URL whose `stockid` equals an allowed code is accepted only when
-    that code also appears in the document text.
+    A labelled `股票代码`, `证券代码`, or `公司代码` (the Shanghai report label) must
+    equal an allowed code. Without a label, a Sina detail URL whose `stockid`
+    equals an allowed code is accepted only when that code also appears in the
+    document text.
 
     :param text: str; visible document text.
     :param reference: FilingRef; document reference.

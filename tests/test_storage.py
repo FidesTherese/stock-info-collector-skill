@@ -222,6 +222,31 @@ class RevisionTests(StoreTestCase):
                                              kind="balance", provider="sina"), NOW, symbols=[SH])
         self.assertEqual([r["data"]["scope"] for r in page["groups"][0]["records"]], ["parent"])
 
+    def test_filing_statements_use_latest_read_per_document(self) -> None:
+        """A re-read document supersedes its older records in latest; all versions keeps both."""
+        from dataclasses import replace
+
+        from stock_info.providers import FilingRef, FilingResult
+
+        uri = "https://money.finance.sina.com.cn/doc"
+        reference = FilingRef(symbol=SH, uri=uri, report_date=date(2024, 12, 31), publication_date=None,
+                              origin="automatic")
+        key = CheckKey(SH.symbol_id, "filing", "filing", "none", uri)
+        for when, locator in ((NOW - timedelta(days=1), "table:1"), (NOW, "table:1+table:2")):
+            record = replace(statement("parent"), source_key=f"{uri}#{locator}", format="html")
+            check_id = self.store.start_check(key, None, "run", when, refresh=True)
+            self.store.finish_check(check_id, FilingResult(
+                state="succeeded", coverage=Coverage(None, traversal="succeeded"), requests=(), issues=(),
+                metadata={}, reference=reference, format="html", body_sha256="h", status="parsed",
+                statements=(record,)), when)
+        span = DateRange(date(2024, 1, 1), date(2025, 1, 31))
+        latest = self.store.query(QueryRequest(symbol=SH, span=span, dataset="statements", provider="filing",
+                                               kind="balance"), NOW, symbols=[SH])
+        self.assertEqual([r["data"]["source_key"][-15:] for r in latest["groups"][0]["records"]], ["table:1+table:2"])
+        every = self.store.query(QueryRequest(symbol=SH, span=span, dataset="statements", provider="filing",
+                                              kind="balance", versions="all"), NOW, symbols=[SH])
+        self.assertEqual(len(every["groups"][0]["records"]), 2)
+
     def test_read_only_store_sees_data_without_writing(self) -> None:
         """A read-only store queries existing data and refuses to start checks."""
         self.record_prices([make_row(2)], NOW)

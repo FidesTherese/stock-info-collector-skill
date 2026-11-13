@@ -1025,10 +1025,12 @@ def decode_html(body: bytes, content_type: str) -> str:
 
 @dataclass
 class HtmlBlock:
-    """Hold one visible text block or one simple table extracted from HTML.
+    """Hold one visible text block or one data table extracted from HTML.
 
-    A table is `simple=False` when it uses nested tables or row/column spans other
-    than 1; such tables are never converted into statements.
+    A table is `simple=False` when it uses row spans, or column spans other than a
+    full-width single-cell label row; such tables are never converted into
+    statements. A full-width label row (for example `流动资产：` spanning every
+    column) is expanded to the title followed by empty cells.
 
     :param kind: Literal["text", "table"]; block type.
     :param text: str; visible text for text blocks, empty for tables.
@@ -1047,16 +1049,45 @@ class HtmlBlock:
     index: int = -1
 
 
+@dataclass
+class _TableFrame:
+    """Track one open table while parsing.
+
+    A frame becomes `layout=True` when another table opens inside it. Layout tables
+    are page scaffolding: their cell text flows into ordinary text blocks and they
+    never become table blocks.
+
+    :param block: HtmlBlock; table block being built.
+    :param layout: bool; True for page-layout tables.
+    :param row: list[str] | None; cells of the open row.
+    :param row_spans: list[int]; column spans of the open row's cells.
+    :param cell: list[str] | None; text pieces of the open cell.
+    :param label_rows: list[int]; indexes of rows that are single-cell spanned labels.
+    return instance: _TableFrame; mutable frame.
+    """
+
+    block: HtmlBlock
+    layout: bool = False
+    row: list[str] | None = None
+    row_spans: list[int] = field(default_factory=list)
+    cell: list[str] | None = None
+    label_rows: list[int] = field(default_factory=list)
+
+
 _BLOCK_TAGS = frozenset({"p", "div", "br", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "section",
                          "article", "body", "html", "center", "hr", "dd", "dt", "dl", "header", "footer"})
+_SPACES = re.compile(r"[ \t\r\f\v　 ]+")
 
 
 class HtmlBlockParser(HTMLParser):
-    """Split HTML into visible text blocks and tables while ignoring scripts and styles.
+    """Split HTML into visible text blocks and data tables while ignoring scripts and styles.
 
-    Links are recorded as (href, anchor text) pairs on the text block in which they
-    appear, together with the text that precedes them, so callers can find dates
-    next to links. Call `feed()` then `close()` and read `blocks`.
+    Tables that contain other tables are treated as page layout: their text flows
+    into text blocks and only the innermost tables become table blocks. Every link,
+    at any depth, is recorded in `link_contexts` as (href, anchor text, up to 200
+    characters of visible text before the link), so callers can find dates printed
+    next to links. Links outside data tables are also attached to their text block.
+    Call `feed()` then `close()` and read `blocks`.
 
     return instance: HtmlBlockParser; parser with an empty block list.
     """
@@ -1068,29 +1099,54 @@ class HtmlBlockParser(HTMLParser):
         """
         super().__init__(convert_charrefs=True)
         self.blocks: list[HtmlBlock] = []
+        self.link_contexts: list[tuple[str, str, str]] = []
         self._text: list[str] = []
         self._links: list[tuple[str, str]] = []
+        self._recent = ""
         self._skip_depth = 0
-        self._table_depth = 0
-        self._table: HtmlBlock | None = None
-        self._row: list[str] | None = None
-        self._cell: list[str] | None = None
+        self._stack: list[_TableFrame] = []
         self._href: str | None = None
         self._anchor: list[str] = []
-        self._table_count = 0
         self._pre_anchor = ""
-        self.link_contexts: list[tuple[str, str, str]] = []
+        self._table_count = 0
+
+    def _data_frame(self) -> _TableFrame | None:
+        """Return the innermost open table when it is a data table, otherwise None.
+
+        return frame: _TableFrame | None; open data table.
+        """
+        return self._stack[-1] if self._stack and not self._stack[-1].layout else None
 
     def _flush_text(self) -> None:
         """Close the current text block when it contains visible text.
 
         return None: None; no value is returned.
         """
-        text = re.sub(r"[ \t\r\f\v　 ]+", " ", "".join(self._text)).strip()
+        text = _SPACES.sub(" ", "".join(self._text)).strip()
         if text or self._links:
             self.blocks.append(HtmlBlock(kind="text", text=text, links=list(self._links)))
         self._text = []
         self._links = []
+
+    def _convert_to_layout(self, frame: _TableFrame) -> None:
+        """Turn a table that turned out to contain another table into layout and keep its text.
+
+        Rows collected so far become text blocks, and the open cell's text continues
+        as ordinary text.
+
+        :param frame: _TableFrame; table to convert.
+        return None: None; no value is returned.
+        """
+        frame.layout = True
+        for row in frame.block.rows:
+            self._text.append(" ".join(c for c in row if c))
+            self._flush_text()
+        frame.block.rows = []
+        if frame.row:
+            self._text.append(" ".join(c for c in frame.row if c) + " ")
+        if frame.cell:
+            self._text.append("".join(frame.cell))
+        frame.row, frame.cell, frame.row_spans = None, None, []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         """Track scripts, tables, rows, cells, links, and block boundaries.
@@ -1105,30 +1161,33 @@ class HtmlBlockParser(HTMLParser):
         if self._skip_depth:
             return
         attr = dict(attrs)
+        frame = self._data_frame()
         if tag == "table":
-            if self._table_depth == 0:
-                self._flush_text()
-                self._table = HtmlBlock(kind="table", index=self._table_count)
-                self._table_count += 1
-            elif self._table is not None:
-                self._table.simple = False
-            self._table_depth += 1
-        elif tag == "tr" and self._table_depth == 1:
-            self._row = []
-        elif tag in ("td", "th") and self._table_depth == 1:
-            for name in ("rowspan", "colspan"):
-                value = (attr.get(name) or "1").strip()
-                if value not in ("", "1") and self._table is not None:
-                    self._table.simple = False
-            self._cell = []
+            if frame is not None:
+                self._convert_to_layout(frame)
+            self._flush_text()
+            self._stack.append(_TableFrame(block=HtmlBlock(kind="table", index=self._table_count)))
+            self._table_count += 1
+        elif tag == "tr" and frame is not None:
+            frame.row, frame.row_spans = [], []
+        elif tag in ("td", "th") and frame is not None:
+            rowspan = (attr.get("rowspan") or "1").strip() or "1"
+            colspan = (attr.get("colspan") or "1").strip() or "1"
+            if rowspan != "1" or not colspan.isdigit() or int(colspan) < 1:
+                frame.block.simple = False
+            frame.row_spans.append(int(colspan) if colspan.isdigit() else 1)
+            frame.cell = []
+        elif tag in ("td", "th", "tr") and self._stack:
+            self._flush_text()
         elif tag == "a":
             self._href = attr.get("href")
             self._anchor = []
-            self._pre_anchor = "".join(self._text)[-200:]
-        elif tag in _BLOCK_TAGS and self._table_depth == 0:
-            self._flush_text()
-        elif tag == "br" and self._cell is not None:
-            self._cell.append(" ")
+            self._pre_anchor = self._recent[-200:]
+        elif tag in _BLOCK_TAGS:
+            if frame is None:
+                self._flush_text()
+            elif frame.cell is not None:
+                frame.cell.append(" ")
 
     def handle_endtag(self, tag: str) -> None:
         """Close cells, rows, tables, links, and block boundaries.
@@ -1141,29 +1200,57 @@ class HtmlBlockParser(HTMLParser):
             return
         if self._skip_depth:
             return
-        if tag in ("td", "th") and self._table_depth == 1 and self._cell is not None:
-            if self._row is None:
-                self._row = []
-            self._row.append(re.sub(r"\s+", " ", "".join(self._cell)).strip())
-            self._cell = None
-        elif tag == "tr" and self._table_depth == 1 and self._row is not None:
-            if self._table is not None and self._row:
-                self._table.rows.append(self._row)
-            self._row = None
-        elif tag == "table" and self._table_depth:
-            self._table_depth -= 1
-            if self._table_depth == 0 and self._table is not None:
-                self.blocks.append(self._table)
-                self._table = None
+        frame = self._data_frame()
+        if tag in ("td", "th") and frame is not None and frame.cell is not None:
+            if frame.row is None:
+                frame.row = []
+            frame.row.append(re.sub(r"\s+", " ", "".join(frame.cell)).strip())
+            frame.cell = None
+        elif tag == "tr" and frame is not None and frame.row is not None:
+            if frame.row:
+                if any(span != 1 for span in frame.row_spans):
+                    if len(frame.row) == 1:
+                        frame.label_rows.append(len(frame.block.rows))
+                    else:
+                        frame.block.simple = False
+                frame.block.rows.append(frame.row)
+            frame.row, frame.row_spans = None, []
+        elif tag == "table" and self._stack:
+            closed = self._stack.pop()
+            if closed.layout:
+                self._flush_text()
+            else:
+                self._finish_table(closed)
         elif tag == "a" and self._href is not None:
             text = re.sub(r"\s+", " ", "".join(self._anchor)).strip()
-            if self._table_depth == 0:
+            if self._data_frame() is None:
                 self._links.append((self._href, text))
-                self.link_contexts.append((self._href, text, self._pre_anchor))
+            self.link_contexts.append((self._href, text, self._pre_anchor))
             self._href = None
             self._anchor = []
-        elif tag in _BLOCK_TAGS and self._table_depth == 0:
+        elif tag in _BLOCK_TAGS and frame is None:
             self._flush_text()
+        elif tag in ("td", "th", "tr") and self._stack:
+            self._flush_text()
+
+    def _finish_table(self, frame: _TableFrame) -> None:
+        """Expand full-width label rows, check geometry, and append the finished data table.
+
+        A spanned single-cell row is accepted only when the table's other rows give
+        a width of at least two columns; it becomes the label followed by empty cells.
+
+        :param frame: _TableFrame; closed data table.
+        return None: None; no value is returned.
+        """
+        block = frame.block
+        widths = [len(r) for i, r in enumerate(block.rows) if i not in frame.label_rows]
+        width = max(widths) if widths else 0
+        for index in frame.label_rows:
+            if width < 2:
+                block.simple = False
+                continue
+            block.rows[index] = block.rows[index] + [""] * (width - 1)
+        self.blocks.append(block)
 
     def handle_data(self, data: str) -> None:
         """Append visible text to the current cell, anchor, or text block.
@@ -1173,19 +1260,26 @@ class HtmlBlockParser(HTMLParser):
         """
         if self._skip_depth:
             return
+        self._recent = (self._recent + data)[-400:]
         if self._href is not None:
             self._anchor.append(data)
-        if self._cell is not None:
-            self._cell.append(data)
-        elif self._table_depth == 0:
+        frame = self._data_frame()
+        if frame is None:
             self._text.append(data)
+        elif frame.cell is not None:
+            frame.cell.append(data)
 
     def close(self) -> None:
-        """Finish parsing and flush the final text block.
+        """Finish parsing, close unterminated tables as non-simple, and flush the final text block.
 
         return None: None; no value is returned.
         """
         super().close()
+        while self._stack:
+            frame = self._stack.pop()
+            if not frame.layout:
+                frame.block.simple = False
+                self._finish_table(frame)
         self._flush_text()
 
 

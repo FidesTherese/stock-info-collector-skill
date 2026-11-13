@@ -75,6 +75,7 @@ The tests use fake HTTP responses and temporary databases. They never contact a 
 - The sources do not guarantee complete history. An empty result is never proof that no trading or reporting happened.
 - Scanned (image-only) PDF filings are reported as unreadable; there is no OCR.
 - Shanghai and Shenzhen code changes are not resolved, because no official mapping source is configured.
-- Live access to the sources was not re-verified during implementation; the source contracts come from earlier observations recorded in the design.
+- Text extraction from real report PDFs usually rejects the tables as ambiguous. The HTML versions of the same reports supply the statements, but a collect that reads PDF attachments ends with status `partial`.
+- The sources were checked live once on 2026-11-13. Their page formats can change without notice.
 
 [↑ Back to Table of Contents](#table-of-contents)
