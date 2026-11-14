@@ -17,14 +17,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from stock_info import providers  # noqa: E402
 from stock_info.providers import (  # noqa: E402
-    CURL_WRITE_ABORT, DateRange, HttpClient, InputError, SourceError, Symbol, compute_sha256, convert_to_json,
-    encode_canonical_json, fetch_prices, fetch_statements, parse_decimal_text,
+    CURL_WRITE_ABORT, DateRange, HttpClient, InputError, SecAccess, SourceError, Symbol, compute_sha256,
+    convert_to_json, encode_canonical_json, fetch_prices, fetch_statements, parse_decimal_text,
 )
 from stock_info.securities import lookup_code_links, parse_symbol, resolve_symbols  # noqa: E402
 
 UTC = timezone.utc
 SH = Symbol("SH:600519", "SH", "600519")
 SZ = Symbol("SZ:300059", "SZ", "300059")
+SEC_URL = "https://data.sec.gov/submissions/CIK0000000001.json"
+SEC_LINE = "Test Operator operator@collector.test"
 
 
 class FakeResponse:
@@ -47,12 +49,13 @@ class FakeResponse:
 
 
 class FakeSession:
-    """Serve canned responses by URL matching and record every request URL.
+    """Serve canned responses by URL matching and record every request URL and its header options.
 
     Each route is (predicate, handler). A handler returns (status, body, headers)
     or raises an exception to simulate a transport failure. The body is delivered
     through `content_callback` in 1 KiB chunks; an abort return raises an error
-    like libcurl does.
+    like libcurl does. `options` holds one object per request with the keys
+    `headers` and `accept_encoding`; both are None unless the caller passed them.
 
     :param routes: list[tuple[Callable[[str], bool], Callable[[str], Any]]]; ordered routes.
     return instance: FakeSession; fake session.
@@ -66,6 +69,7 @@ class FakeSession:
         """
         self.routes = list(routes or [])
         self.calls: list[str] = []
+        self.options: list[dict[str, Any]] = []
         self.closed = False
 
     def add(self, predicate: Callable[[str], bool], handler: Callable[[str], Any]) -> None:
@@ -78,7 +82,8 @@ class FakeSession:
         self.routes.append((predicate, handler))
 
     def get(self, url: str, *, timeout: float, allow_redirects: bool, proxy: str,
-            content_callback: Callable[[bytes], int]) -> FakeResponse:
+            content_callback: Callable[[bytes], int], headers: dict[str, str] | None = None,
+            accept_encoding: str | None = None) -> FakeResponse:
         """Serve one request through the first matching route and return the fake response.
 
         :param url: str; requested URL.
@@ -86,10 +91,13 @@ class FakeSession:
         :param allow_redirects: bool; must be False.
         :param proxy: str; must be an empty string.
         :param content_callback: Callable[[bytes], int]; body sink.
+        :param headers: dict[str, str] | None; request headers that the caller set, or None.
+        :param accept_encoding: str | None; accepted encodings that the caller set, or None.
         return response: FakeResponse; status and headers.
         """
         assert allow_redirects is False and proxy == ""
         self.calls.append(url)
+        self.options.append({"headers": headers, "accept_encoding": accept_encoding})
         for predicate, handler in self.routes:
             if predicate(url):
                 status, body, headers = handler(url)
@@ -322,6 +330,83 @@ class HttpClientTests(unittest.TestCase):
         with self.assertRaises(SourceError) as ctx:
             client.get("https://quotes.sina.cn/x", max_bytes=10)
         self.assertEqual(ctx.exception.issue.code, "budget_exhausted")
+
+
+class SecRequestTests(unittest.TestCase):
+    """Check that the SEC contact line reaches SEC hosts only and that missing access blocks requests."""
+
+    def make(self, access: SecAccess | None, routes: list[Any] | None = None) -> HttpClient:
+        """Create a client with separate fake sessions for browser-like and SEC requests and return it.
+
+        The fakes are stored as `self.browser` and `self.plain`; `self.loads` counts
+        how often the client asked for the SEC access record.
+
+        :param access: SecAccess | None; record that the loader returns; None passes no loader at all.
+        :param routes: list[Any] | None; routes shared by both fake sessions.
+        return client: HttpClient; client for tests.
+        """
+        self.browser, self.plain, self.loads = FakeSession(routes), FakeSession(routes), 0
+
+        def load() -> SecAccess:
+            """Count the call and return the prepared access record.
+
+            return access: SecAccess; prepared record.
+            """
+            self.loads += 1
+            assert access is not None
+            return access
+
+        return HttpClient(session_factory=lambda: self.browser, sec_session_factory=lambda: self.plain,
+                          sec_access=load if access is not None else None, sleep=lambda _s: None)
+
+    def test_sec_request_without_contact_is_blocked_before_any_traffic(self) -> None:
+        """Without a contact, an SEC request fails with the given reason and no request is counted or sent."""
+        cases = [(None, "sec_contact_missing"), (SecAccess(), "sec_contact_missing"),
+                 (SecAccess(block_code="config_not_ignored", block_message="add an ignore rule"),
+                  "config_not_ignored")]
+        for access, expected in cases:
+            client = self.make(access, [(lambda u: True, lambda _u: (200, b"{}", {}))])
+            with self.assertRaises(SourceError) as ctx:
+                client.get(SEC_URL, max_bytes=10)
+            self.assertEqual(ctx.exception.issue.code, expected)
+            self.assertEqual((client.attempts, ctx.exception.requests), (0, ()))
+            self.assertEqual(self.browser.calls + self.plain.calls, [])
+        self.assertEqual(ctx.exception.issue.message, "add an ignore rule")
+
+    def test_sec_request_carries_only_the_declared_headers(self) -> None:
+        """An SEC request uses the plain session with the contact line and gzip or deflate encoding."""
+        client = self.make(SecAccess(user_agent=SEC_LINE), [(lambda u: True, lambda _u: (200, b"{}", {}))])
+        self.assertEqual(client.get(SEC_URL, max_bytes=10).body, b"{}")
+        self.assertEqual(client.get("https://www.sec.gov/files/company_tickers.json", max_bytes=10).body, b"{}")
+        expected = {"headers": {"User-Agent": SEC_LINE}, "accept_encoding": "gzip, deflate"}
+        self.assertEqual(self.plain.options, [expected, expected])
+        self.assertEqual(self.browser.calls, [])
+        self.assertEqual(self.loads, 1)
+
+    def test_other_hosts_never_receive_or_load_the_contact_line(self) -> None:
+        """A request to another host uses the browser-like session and never reads the settings."""
+        client = self.make(SecAccess(user_agent=SEC_LINE), [(lambda u: True, lambda _u: (200, b"ok", {}))])
+        client.get("https://quotes.sina.cn/x", max_bytes=10)
+        self.assertEqual(self.browser.options, [{"headers": None, "accept_encoding": None}])
+        self.assertEqual((self.plain.calls, self.loads), ([], 0))
+
+    def test_redirect_away_from_the_sec_drops_the_contact_line(self) -> None:
+        """After a redirect from an SEC host to another allowed host, the next request carries no contact."""
+        target = "https://www.bse.cn/moved"
+        routes = [(lambda u: u == SEC_URL, lambda _u: (302, b"", {"Location": target})),
+                  (lambda u: u == target, lambda _u: (200, b"ok", {}))]
+        client = self.make(SecAccess(user_agent=SEC_LINE), routes)
+        self.assertEqual(client.get(SEC_URL, max_bytes=10).body, b"ok")
+        self.assertEqual((self.plain.calls, self.browser.calls), ([SEC_URL], [target]))
+        self.assertEqual(self.browser.options, [{"headers": None, "accept_encoding": None}])
+
+    def test_close_closes_both_sessions(self) -> None:
+        """Closing the client closes the browser-like session and the SEC session."""
+        client = self.make(SecAccess(user_agent=SEC_LINE), [(lambda u: True, lambda _u: (200, b"ok", {}))])
+        client.get(SEC_URL, max_bytes=10)
+        client.get("https://quotes.sina.cn/x", max_bytes=10)
+        client.close()
+        self.assertTrue(self.browser.closed and self.plain.closed)
 
 
 class PriceAdapterTests(unittest.TestCase):

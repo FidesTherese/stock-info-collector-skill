@@ -5,6 +5,7 @@
 
 - [What This Project Does](#what-this-project-does)
 - [Set Up](#set-up)
+- [Settings](#settings)
 - [Run the Collector](#run-the-collector)
 - [Run the Tests](#run-the-tests)
 - [Where Things Are](#where-things-are)
@@ -35,7 +36,49 @@ python -m venv .venv
 
 On macOS or Linux, use `python3 -m venv .venv` and `.venv/bin/python -m pip install -r requirements.txt`.
 
-No API key or configuration file is needed.
+No API key is needed. A-share collection needs no settings at all. The [Settings](#settings) section describes the one private file that access to the US regulator's data will need.
+
+[↑ Back to Table of Contents](#table-of-contents)
+
+## Settings
+
+The US Securities and Exchange Commission (SEC) asks every automated tool to state who operates it: a name and an e-mail address. The collector reads these details from a private file named `config.toml` in this directory. The repository contains only an empty template, [`config.example.toml`](config.example.toml). It never contains anyone's details, and the source code contains none either.
+
+US share collection, which will use these details, is not implemented yet. Today the details are read by the `config` command, and by the HTTP client before a request to an SEC server.
+
+**Each person uses their own details.** Follow these steps in order:
+
+1. Check that Git ignores the private file. This repository does not publish a `.gitignore` file, so a fresh copy has no ignore rules.
+
+   ```powershell
+   .\.venv\Scripts\python -B scripts\market_data.py config --json
+   ```
+
+   The answer must contain `"git_state": "ignored"`, or `"no_repository"` when the directory is not inside a Git repository. When it contains `"not_ignored"`, add an ignore rule and run the command again:
+
+   ```powershell
+   Add-Content .git\info\exclude "config.toml"
+   ```
+
+2. Copy the template and write your own name and address between the quotation marks. Use plain letters in the name, for example `Jose` for `José`.
+
+   ```powershell
+   Copy-Item config.example.toml config.toml
+   notepad config.toml
+   ```
+
+3. Run the `config` command again. The answer must contain `"sec_contact": "configured"`.
+
+On macOS or Linux, the matching commands are `.venv/bin/python -B scripts/market_data.py config --json`, `echo "config.toml" >> .git/info/exclude`, and `cp config.example.toml config.toml`.
+
+The collector protects the details in these ways:
+
+- It sends them to SEC servers only (`www.sec.gov` and `data.sec.gov`), and to no other source.
+- It reads the file only when it is about to contact the SEC.
+- It never reads a file that Git tracks or does not ignore. It reports `config_tracked_by_git` or `config_not_ignored` and explains the repair.
+- It never prints or logs the details, and it never stores them in the database. The `config` command shows only whether the details are present.
+
+Never commit `config.toml`, and never write your details into `config.example.toml`.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -69,6 +112,7 @@ The tests use fake HTTP responses and temporary databases. They never contact a 
 - [`tests/`](tests/README.md) contains the automated tests.
 - [`data/`](data/README.md) holds the local database, which Git does not track.
 - [`requirements.txt`](requirements.txt) lists the two runtime dependencies.
+- [`config.example.toml`](config.example.toml) is the empty template for the private settings file `config.toml`.
 - `doc/` holds internal design records for the project's developers; they are not part of the public repository.
 
 [↑ Back to Table of Contents](#table-of-contents)

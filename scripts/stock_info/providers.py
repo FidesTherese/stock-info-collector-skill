@@ -24,7 +24,7 @@ PriceProvider: TypeAlias = Literal["eastmoney", "tencent"]
 Provider: TypeAlias = Literal["eastmoney", "tencent", "sina", "filing", "bse"]
 StatementKind: TypeAlias = Literal["income", "balance", "cash_flow"]
 Scope: TypeAlias = Literal["consolidated", "parent", "unknown"]
-Dataset: TypeAlias = Literal["prices", "income", "balance", "cash_flow", "discovery", "filing", "mapping"]
+Dataset: TypeAlias = Literal["prices", "income", "balance", "cash_flow", "discovery", "filing", "mapping", "settings"]
 State: TypeAlias = Literal["running", "succeeded", "partial", "failed", "blocked"]
 JsonValue: TypeAlias = None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
 UtcClock: TypeAlias = Callable[[], datetime]
@@ -50,7 +50,8 @@ FILING_HOSTS = frozenset({
     "vip.stock.finance.sina.com.cn", "money.finance.sina.com.cn", "file.finance.sina.com.cn",
     "www.sse.com.cn", "www.szse.cn", "www.bse.cn", "www.cninfo.com.cn", "static.cninfo.com.cn",
 })
-ALLOWED_HOSTS = API_HOSTS | FILING_HOSTS
+SEC_HOSTS = frozenset({"www.sec.gov", "data.sec.gov"})
+ALLOWED_HOSTS = API_HOSTS | FILING_HOSTS | SEC_HOSTS
 SINA_HOSTS = frozenset({"vip.stock.finance.sina.com.cn", "money.finance.sina.com.cn", "file.finance.sina.com.cn"})
 RETRY_STATUSES = frozenset({408, 500, 502, 503, 504})
 
@@ -180,6 +181,36 @@ class RequestMeta:
     body_sha256: str | None
     checked_at: datetime
     outcome: str
+
+
+@dataclass(frozen=True, repr=False)
+class SecAccess:
+    """Say whether requests to the SEC may be sent, and with which identification line.
+
+    The SEC asks every automated tool to state who operates it. `user_agent` holds
+    that line (`NAME EMAIL`) and is personal data: `repr()` shows only whether the
+    record is configured or blocked, and convert_to_json leaves the line out. When
+    `user_agent` is None, SEC requests are blocked, and the two block fields give
+    the reason; the block fields have no meaning for a configured record.
+
+    :param user_agent: str | None; line for the `User-Agent` header, or None when blocked.
+    :param block_code: str; issue code that explains the block, such as `sec_contact_missing`.
+    :param block_message: str; explanation that tells the person what to do next.
+    return instance: SecAccess; immutable access record.
+    """
+
+    user_agent: str | None = field(default=None, repr=False)
+    block_code: str = "sec_contact_missing"
+    block_message: str = ("No SEC contact is configured. Copy config.example.toml to config.toml and fill in"
+                          " contact_name and contact_email.")
+
+    def __repr__(self) -> str:
+        """Describe the record without the contact line and return the text.
+
+        return text: str; `SecAccess(configured)` or `SecAccess(blocked: CODE)`.
+        """
+        state = "configured" if self.user_agent is not None else f"blocked: {self.block_code}"
+        return f"SecAccess({state})"
 
 
 @dataclass(frozen=True)
@@ -775,9 +806,11 @@ def compute_china_day(value: datetime) -> date:
 def convert_to_json(value: Any) -> JsonValue:
     """Convert records, dates, decimals, and containers into plain JSON values and return them.
 
-    Dataclasses become objects with every field (None values stay as null keys).
-    Dates become ISO strings, aware datetimes become UTC strings ending in `Z`,
-    decimals become strings, and tuples become lists. Unsupported types raise TypeError.
+    Dataclasses become objects with every field (None values stay as null keys),
+    except fields declared with `repr=False`: those hold private values, such as
+    the SEC contact line, and are left out. Dates become ISO strings, aware
+    datetimes become UTC strings ending in `Z`, decimals become strings, and
+    tuples become lists. Unsupported types raise TypeError.
 
     :param value: Any; record or JSON-compatible value.
     return json_value: JsonValue; plain JSON value.
@@ -795,7 +828,7 @@ def convert_to_json(value: Any) -> JsonValue:
     if isinstance(value, date):
         return value.isoformat()
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {f.name: convert_to_json(getattr(value, f.name)) for f in dataclasses.fields(value)}
+        return {f.name: convert_to_json(getattr(value, f.name)) for f in dataclasses.fields(value) if f.repr}
     if isinstance(value, (list, tuple)):
         return [convert_to_json(v) for v in value]
     if isinstance(value, dict):
@@ -1313,6 +1346,20 @@ def create_default_session() -> Any:
     return curl_requests.Session(impersonate="chrome", verify=True, trust_env=False)
 
 
+def create_sec_session() -> Any:
+    """Create a plain curl_cffi session for SEC hosts, with TLS verification and no proxy.
+
+    The session does not imitate a browser. The SEC asks automated tools to
+    identify themselves, so SEC requests carry only the headers that the client
+    sets: the declared contact line and the accepted encodings.
+
+    return session: curl_cffi.requests.Session; configured session.
+    """
+    from curl_cffi import requests as curl_requests
+
+    return curl_requests.Session(verify=True, trust_env=False)
+
+
 class HttpClient:
     """Perform bounded, sequential HTTPS GET requests and return complete bodies.
 
@@ -1323,6 +1370,13 @@ class HttpClient:
     once after two seconds. HTTP 429 cools the host for the rest of the run. Failures
     raise SourceError carrying the attempts. The client is not thread-safe.
 
+    Requests to SEC hosts (`SEC_HOSTS`) use a separate plain session and carry the
+    contact line from `sec_access` as their `User-Agent` header. The client calls
+    `sec_access` only before its first SEC request and keeps the answer. Without a
+    contact line, an SEC request raises SourceError with the block code before any
+    network traffic, and no attempt is counted. Requests to every other host use
+    the browser-like session and never carry the contact line.
+
     :param max_requests: int; total attempt budget, 1 to 512.
     :param run_seconds: float; run deadline in seconds.
     :param request_timeout: float; timeout per attempt in seconds.
@@ -1330,6 +1384,8 @@ class HttpClient:
     :param retry_delay: float; seconds before the single retry.
     :param total_bytes: int; total body bytes allowed for the run.
     :param session_factory: Callable[[], Any] | None; creates the HTTP session; tests inject fakes.
+    :param sec_access: Callable[[], SecAccess] | None; loads the SEC contact on demand; None blocks SEC requests.
+    :param sec_session_factory: Callable[[], Any] | None; creates the plain SEC session; tests inject fakes.
     :param monotonic: Callable[[], float]; monotonic clock.
     :param sleep: Callable[[float], None]; sleep function.
     :param clock: UtcClock; aware UTC clock for attempt timestamps.
@@ -1338,8 +1394,10 @@ class HttpClient:
 
     def __init__(self, *, max_requests: int = 256, run_seconds: float = 900.0, request_timeout: float = 12.0,
                  start_gap: float = 1.0, retry_delay: float = 2.0, total_bytes: int = TOTAL_MAX_BYTES,
-                 session_factory: Callable[[], Any] | None = None, monotonic: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep,
+                 session_factory: Callable[[], Any] | None = None,
+                 sec_access: Callable[[], SecAccess] | None = None,
+                 sec_session_factory: Callable[[], Any] | None = None,
+                 monotonic: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
                  clock: UtcClock = lambda: datetime.now(timezone.utc)) -> None:
         """Store limits and create the session lazily on the first request.
 
@@ -1352,6 +1410,10 @@ class HttpClient:
         self.total_bytes = total_bytes
         self._session_factory = session_factory or create_default_session
         self._session: Any = None
+        self._sec_access_loader = sec_access
+        self._sec_access: SecAccess | None = None
+        self._sec_session_factory = sec_session_factory or create_sec_session
+        self._sec_session: Any = None
         self._monotonic = monotonic
         self._sleep = sleep
         self._clock = clock
@@ -1362,15 +1424,31 @@ class HttpClient:
         self.received_bytes = 0
 
     def close(self) -> None:
-        """Close the HTTP session when one was created.
+        """Close the browser-like session and the SEC session when they were created.
 
         return None: None; no value is returned.
         """
-        if self._session is not None:
-            try:
+        try:
+            if self._session is not None:
                 self._session.close()
-            finally:
-                self._session = None
+        finally:
+            self._session = None
+            if self._sec_session is not None:
+                try:
+                    self._sec_session.close()
+                finally:
+                    self._sec_session = None
+
+    def _resolve_sec_access(self) -> SecAccess:
+        """Load the SEC access record on the first call, keep it, and return it.
+
+        Without a loader the record is blocked with the code `sec_contact_missing`.
+
+        return access: SecAccess; contact line for SEC requests, or the reason why they are blocked.
+        """
+        if self._sec_access is None:
+            self._sec_access = self._sec_access_loader() if self._sec_access_loader is not None else SecAccess()
+        return self._sec_access
 
     def get(self, url: str, *, max_bytes: int) -> ResponseData:
         """Fetch one URL with validated redirects and return the complete HTTP 200 body.
@@ -1457,6 +1535,12 @@ class HttpClient:
         if host in self._cooldowns:
             raise SourceError(self._issue("rate_limited", "host is cooling down after HTTP 429", url, retryable=True),
                               tuple(metas))
+        sec_line: str | None = None
+        if host in SEC_HOSTS:
+            access = self._resolve_sec_access()
+            if access.user_agent is None:
+                raise SourceError(self._issue(access.block_code, access.block_message, url), tuple(metas))
+            sec_line = access.user_agent
         if self.attempts >= self.max_requests:
             raise SourceError(self._issue("budget_exhausted", "request budget is exhausted", url, retryable=True),
                               tuple(metas))
@@ -1491,12 +1575,19 @@ class HttpClient:
             buffer.extend(chunk)
             return len(chunk)
 
-        if self._session is None:
+        if sec_line is not None and self._sec_session is None:
+            self._sec_session = self._sec_session_factory()
+        if sec_line is None and self._session is None:
             self._session = self._session_factory()
         timeout = max(0.1, min(self.request_timeout, self._deadline - self._monotonic()))
         try:
-            response = self._session.get(url, timeout=timeout, allow_redirects=False, proxy="",
-                                         content_callback=collect_chunk)
+            if sec_line is not None:
+                response = self._sec_session.get(url, timeout=timeout, allow_redirects=False, proxy="",
+                                                 content_callback=collect_chunk, headers={"User-Agent": sec_line},
+                                                 accept_encoding="gzip, deflate")
+            else:
+                response = self._session.get(url, timeout=timeout, allow_redirects=False, proxy="",
+                                             content_callback=collect_chunk)
         except Exception as exc:  # curl_cffi raises RequestException subclasses
             self.received_bytes += len(buffer)
             if abort:

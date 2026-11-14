@@ -13,6 +13,7 @@ description: Collect and query historical data for one Shanghai, Shenzhen, or Be
 - [Collect Data](#collect-data)
 - [Show Stored Data](#show-stored-data)
 - [Read the Result Correctly](#read-the-result-correctly)
+- [Private Settings](#private-settings)
 - [Exit Codes](#exit-codes)
 
 ## When to Use This Skill
@@ -78,13 +79,28 @@ Selectors that do not apply to a dataset are rejected: prices accept `--provider
 
 [↑ Back to Table of Contents](#table-of-contents)
 
+## Private Settings
+
+The file `config.toml` in the skill's root directory holds the owner's name and e-mail address for the US regulator (SEC). A-share commands never read it.
+
+- **Never open, print, copy, or commit `config.toml`.** To learn its state, run the `config` command, which shows no details:
+
+  ```powershell
+  .\.venv\Scripts\python -B scripts\market_data.py config --json
+  ```
+
+- `settings.sec_contact` is `configured`, `missing`, `invalid`, or `blocked`. `settings.git_state` must be `ignored` or `no_repository`.
+- When an issue appears, show its `message` to the user. The message explains the repair. Do not write contact details into any file yourself unless the user gives them to you for that purpose, and then write them only into `config.toml`.
+
+[↑ Back to Table of Contents](#table-of-contents)
+
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Collect finished with fresh, complete-as-attempted data, or show ran its query |
+| 0 | Collect finished with fresh, complete-as-attempted data, show ran its query, or config found no error |
 | 3 | Collect finished partially: some source failed, data is stale, or work is pending |
-| 2 | Invalid input, such as a bad symbol, date, or selector |
+| 2 | Invalid input, such as a bad symbol, date, or selector; or an unusable or unprotected settings file |
 | 1 | Storage or internal error, or show was run before any database exists |
 
 [↑ Back to Table of Contents](#table-of-contents)

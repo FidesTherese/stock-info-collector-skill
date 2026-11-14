@@ -4,10 +4,15 @@ Usage (from the project root):
     python -B scripts/market_data.py collect SYMBOL --json [--start DATE] [--end DATE] [--refresh]
         [--filing URI ...] [--db PATH] [--max-requests N]
     python -B scripts/market_data.py show SYMBOL --json --dataset prices|statements|filings|coverage [...]
+    python -B scripts/market_data.py config --json
 
 The command writes one JSON envelope to standard output and log lines to
-standard error. Exit codes: 0 satisfied collect or executed show, 3 partial
-collect, 2 invalid input, 1 fatal storage or internal error.
+standard error. Exit codes: 0 satisfied collect, executed show, or usable
+settings; 3 partial collect; 2 invalid input or unusable settings; 1 fatal
+storage or internal error.
+
+The `config` command reports the state of the private settings file
+`config.toml` without showing the contact details in it.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import urlsplit
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -26,10 +32,11 @@ if __package__ in (None, ""):
 from stock_info.collector import build_envelope, build_error_envelope, collect, show  # noqa: E402
 from stock_info.filings import _LocalFileError, resolve_local_path  # noqa: E402
 from stock_info.providers import (  # noqa: E402
-    CollectRequest, DateRange, FilingRef, HttpClient, InputError, Issue, QueryRequest, SourceError, StorageError,
-    Symbol, compute_china_day, make_issue, normalize_source_url, validate_remote_url,
+    FILING_HOSTS, CollectRequest, DateRange, FilingRef, HttpClient, InputError, Issue, QueryRequest, SourceError,
+    StorageError, Symbol, compute_china_day, make_issue, normalize_source_url, validate_remote_url,
 )
 from stock_info.securities import parse_symbol  # noqa: E402
+from stock_info.settings import load_settings, summarize_settings  # noqa: E402
 from stock_info.storage import Store  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,15 +52,18 @@ DATASET_SELECTORS: dict[str, dict[str, Any]] = {
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the argument parser for the collect and show commands and return it.
+    """Build the argument parser for the collect, show, and config commands and return it.
 
     Optional selectors default to None so that validation can reject a selector
-    that was given explicitly but does not apply to the chosen dataset.
+    that was given explicitly but does not apply to the chosen dataset. The config
+    command takes no symbol.
 
     return parser: argparse.ArgumentParser; configured parser.
     """
     parser = argparse.ArgumentParser(prog="market_data.py", description="Collect and show A-share market data.")
     commands = parser.add_subparsers(dest="command", required=True)
+    config = commands.add_parser("config", help="report the state of the private settings file")
+    config.add_argument("--json", action="store_true", help="required; write a JSON object")
     for name in ("collect", "show"):
         sub = commands.add_parser(name)
         sub.add_argument("symbol", metavar="SYMBOL")
@@ -134,8 +144,8 @@ def resolve_db_path(value: str | None) -> Path:
 def build_filing_refs(values: list[str] | None, symbol: Symbol) -> tuple[FilingRef, ...]:
     """Validate explicit filing URIs and return them as references.
 
-    At most five values are allowed. HTTPS values must name an allowed source host;
-    other values must be local files under the project root.
+    At most five values are allowed. HTTPS values must name an allowed Sina or
+    exchange filing host; other values must be local files under the project root.
 
     :param values: list[str] | None; explicit URIs or paths.
     :param symbol: Symbol; requested symbol.
@@ -151,6 +161,8 @@ def build_filing_refs(values: list[str] | None, symbol: Symbol) -> tuple[FilingR
             reason = validate_remote_url(url)
             if reason is not None:
                 raise_input_error("invalid_path", f"--filing {value!r}: {reason}")
+            if (urlsplit(url).hostname or "") not in FILING_HOSTS:
+                raise_input_error("invalid_path", f"--filing {value!r}: URL host is not an allowed filing host")
         else:
             try:
                 path = resolve_local_path(value, ROOT)
@@ -223,11 +235,16 @@ def configure_logging() -> logging.Handler:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Parse arguments, run collect or show, write the JSON envelope, and return the exit code.
+    """Parse arguments, run collect, show, or config, write the JSON envelope, and return the exit code.
 
     Argument syntax errors and `--help` use argparse's standard text on standard
     error (exit 2 for errors). Validation errors, storage errors, and unexpected
     errors still produce a JSON envelope. Resources are closed in every case.
+
+    The config command writes the object described by summarize_settings and
+    returns 2 when its status is `error`. The collect command gives the HTTP client
+    a function that loads the settings; the client calls it only before its first
+    request to an SEC host, so other runs never read the settings file.
 
     :param argv: Sequence[str] | None; arguments without the program name; None reads sys.argv.
     return code: int; 0, 1, 2, or 3.
@@ -242,6 +259,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if not args.json:
             raise_input_error("invalid_selector", "--json is required")
+        if args.command == "config":
+            summary = summarize_settings(load_settings(ROOT))
+            write_json(summary)
+            return EXIT_INPUT if summary["status"] == "error" else EXIT_OK
         symbol = parse_symbol(args.symbol)
         today = compute_china_day(clock())
         span = parse_range(args.start, args.end, today)
@@ -253,7 +274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             request = CollectRequest(symbol=symbol, span=span, refresh=args.refresh,
                                      filings=build_filing_refs(args.filing, symbol))
             store = Store(db_path)
-            http = HttpClient(max_requests=max_requests)
+            http = HttpClient(max_requests=max_requests, sec_access=lambda: load_settings(ROOT).sec_access)
             envelope = collect(store, http, request, clock)
             write_json(envelope)
             return EXIT_OK if envelope["status"] == "ok" else EXIT_PARTIAL

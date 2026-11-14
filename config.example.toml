@@ -1,0 +1,16 @@
+# Local settings for the stock information collector.
+#
+# 1. Copy this file to "config.toml" in the same folder.
+# 2. Write your own details between the quotation marks in "config.toml".
+# 3. Never commit "config.toml". Git must ignore it. Check with:
+#        python -B scripts/market_data.py config --json
+#
+# This template stays empty. Do not write your details into this file.
+
+[sec]
+# The US Securities and Exchange Commission (SEC) asks every automated tool
+# to state who operates it. The collector sends this name and this e-mail
+# address to SEC servers only, and to no other source.
+# Use plain letters in the name, for example: contact_name = "Jane Doe"
+contact_name = ""
+contact_email = ""

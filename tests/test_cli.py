@@ -1,9 +1,14 @@
-"""Tests for the command-line interface: JSON envelopes, selectors, exit codes, and read-only show."""
+"""Tests for the command-line interface: JSON envelopes, selectors, exit codes, read-only show, and settings.
+
+The contact details in this module are made up, their addresses end in the reserved name
+`.test`, and no test sends them anywhere.
+"""
 
 from __future__ import annotations
 
 import io
 import json
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -29,6 +34,9 @@ GROUP_KEYS = {"symbol_id", "provider", "dataset", "adjustment", "resource", "sel
               "state", "freshness", "coverage", "market_completeness", "absent_dates_reason", "last_attempt_at",
               "last_success_at", "last_full_recheck_at", "records"}
 RANGE = ["--start", "2025-01-01", "--end", "2025-12-31"]
+CONTACT_NAME = "Test Operator"
+CONTACT_EMAIL = "operator@collector.test"
+VALID_CONFIG = f'[sec]\ncontact_name = "{CONTACT_NAME}"\ncontact_email = "{CONTACT_EMAIL}"\n'
 
 
 def count_checks(db: Path) -> int:
@@ -88,6 +96,9 @@ class ValidationTests(CliTestCase):
             (["collect", "600519", "--json", "--max-requests", "0"], "invalid_selector"),
             (["collect", "600519", "--json", "--db", "../escape.sqlite3"], "invalid_path"),
             (["collect", "600519", "--json", "--filing", "../x.pdf"], "invalid_path"),
+            (["collect", "600519", "--json", "--filing", "https://www.sec.gov/Archives/x.htm"], "invalid_path"),
+            (["collect", "600519", "--json", "--filing", "https://quotes.sina.cn/x.htm"], "invalid_path"),
+            (["config"], "invalid_selector"),
             (["show", "600519", "--json", "--dataset", "prices", "--scope", "all"], "invalid_selector"),
             (["show", "600519", "--json", "--dataset", "coverage", "--versions", "latest"], "invalid_selector"),
             (["show", "600519", "--json", "--dataset", "filings", "--provider", "sina"], "invalid_selector"),
@@ -141,6 +152,80 @@ class RoundTripTests(CliTestCase):
         self.assertTrue(all(r["type"] == "check" for g in coverage["datasets"] for r in g["records"]))
         after = count_checks(db)
         self.assertEqual((before, len(self.session.calls)), (after, calls))
+
+
+class ConfigCommandTests(CliTestCase):
+    """Check the config command and the connection between the settings file and the HTTP client."""
+
+    def test_missing_settings_file_is_reported_without_an_error(self) -> None:
+        """Without a settings file the command exits 0 and reports a missing contact as a warning."""
+        code, summary = self.run_main("config", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(set(summary), {"schema_version", "command", "status", "settings", "issues"})
+        self.assertEqual((summary["command"], summary["status"]), ("config", "ok"))
+        self.assertEqual(summary["settings"], {"file": "config.toml", "template": "config.example.toml",
+                                               "exists": False, "git_state": "no_repository",
+                                               "sec_contact": "missing"})
+        self.assertEqual([(i["code"], i["severity"]) for i in summary["issues"]],
+                         [("sec_contact_missing", "warning")])
+
+    def test_configured_contact_is_reported_without_its_details(self) -> None:
+        """A valid settings file is reported as configured, and the output never shows the details."""
+        (self.root / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+        code, summary = self.run_main("config", "--json")
+        self.assertEqual((code, summary["status"], summary["issues"]), (0, "ok", []))
+        self.assertEqual(summary["settings"]["sec_contact"], "configured")
+        text = json.dumps(summary)
+        for secret in (CONTACT_NAME, CONTACT_EMAIL, self.root.name):
+            self.assertNotIn(secret, text)
+
+    def test_invalid_settings_file_exits_2(self) -> None:
+        """An unusable settings file gives the status error, the issue config_invalid, and exit code 2."""
+        (self.root / "config.toml").write_text(f'[sec]\ncontact_name = "{CONTACT_NAME}"\n', encoding="utf-8")
+        code, summary = self.run_main("config", "--json")
+        self.assertEqual((code, summary["status"], summary["settings"]["sec_contact"]), (2, "error", "invalid"))
+        self.assertEqual(summary["issues"][0]["code"], "config_invalid")
+        self.assertNotIn(CONTACT_NAME, json.dumps(summary))
+
+    @unittest.skipUnless(shutil.which("git"), "the git program is not installed")
+    def test_settings_file_that_git_does_not_ignore_is_blocked(self) -> None:
+        """In a real repository without an ignore rule the contact is blocked until a rule is added."""
+        subprocess.run(["git", "-C", str(self.root), "init", "-q", "."], check=True, capture_output=True,
+                       stdin=subprocess.DEVNULL, timeout=30)
+        (self.root / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+        code, summary = self.run_main("config", "--json")
+        self.assertEqual((code, summary["status"]), (2, "error"))
+        self.assertEqual((summary["settings"]["git_state"], summary["settings"]["sec_contact"]),
+                         ("not_ignored", "blocked"))
+        self.assertEqual(summary["issues"][0]["code"], "config_not_ignored")
+        with (self.root / ".git" / "info" / "exclude").open("a", encoding="utf-8") as handle:
+            handle.write("\nconfig.toml\n")
+        code, summary = self.run_main("config", "--json")
+        self.assertEqual((code, summary["settings"]["git_state"], summary["settings"]["sec_contact"]),
+                         (0, "ignored", "configured"))
+
+    def test_collect_gives_the_client_a_loader_and_does_not_read_settings_itself(self) -> None:
+        """Collect hands the HTTP client a settings loader; an A-share collect never calls it."""
+        (self.root / "config.toml").write_text(VALID_CONFIG, encoding="utf-8")
+        captured: dict[str, Any] = {}
+
+        def build(**options: Any) -> Any:
+            """Record the options given to HttpClient and return a client that uses the fake session.
+
+            :param options: Any; keyword options from the command-line entry point.
+            return client: Any; HttpClient for tests.
+            """
+            captured.update(options)
+            return make_client(self.session, **options)
+
+        with mock.patch.object(market_data, "HttpClient", side_effect=build), \
+                mock.patch.object(market_data, "load_settings", wraps=market_data.load_settings) as loader:
+            code, _envelope = self.run_main("collect", "600519", "--json", *RANGE)
+            self.assertEqual(code, 0)
+            loader.assert_not_called()
+            access = captured["sec_access"]()
+            loader.assert_called_once_with(self.root)
+        self.assertEqual(access.user_agent, f"{CONTACT_NAME} {CONTACT_EMAIL}")
 
 
 class SubprocessTests(unittest.TestCase):
