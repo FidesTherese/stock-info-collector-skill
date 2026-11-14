@@ -1,4 +1,4 @@
-"""Symbol parsing, official Beijing Stock Exchange code mappings, and alias resolution.
+"""Symbol parsing for A-shares and US shares, official Beijing Stock Exchange code mappings, and alias resolution.
 
 The module never touches SQLite. It reads the official BSE code-mapping page
 through providers.HttpClient and resolves aliases only from verified links.
@@ -30,6 +30,13 @@ _FORMS = (
     re.compile(r"(?P<ex>sh|sz|bj):(?P<code>\d{6})", re.IGNORECASE),
     re.compile(r"(?P<code>\d{6})"),
 )
+# A US ticker has one to five letters and an optional one-letter share class after `.` or `-`.
+_US_TICKER = r"(?P<ticker>[a-z]{1,5})(?:[.\-](?P<class>[a-z]))?"
+_US_FORMS = (
+    re.compile(rf"us:{_US_TICKER}", re.IGNORECASE),
+    re.compile(rf"{_US_TICKER}\.us", re.IGNORECASE),
+    re.compile(_US_TICKER, re.IGNORECASE),
+)
 
 
 def infer_exchange(code: str) -> str | None:
@@ -47,13 +54,16 @@ def infer_exchange(code: str) -> str | None:
 def parse_symbol(text: str) -> Symbol:
     """Parse a user-supplied symbol and return its canonical Symbol.
 
-    Accepted forms are `sh600519`, `600519.SH`, `SH:600519`, and a bare six-digit
-    code. The code prefix must belong to the explicit market when one is given.
-    The result does not prove that the security exists. Raises InputError with code
-    `invalid_symbol` for any other input.
+    Accepted A-share forms are `sh600519`, `600519.SH`, `SH:600519`, and a bare
+    six-digit code. The code prefix must belong to the explicit market when one is
+    given. Accepted US forms are a bare ticker (`AAPL`), `US:AAPL`, and `AAPL.US`;
+    a ticker has one to five letters and an optional one-letter share class
+    written `BRK.B` or `BRK-B`. The canonical US code is upper case with `-`
+    before the class, as the SEC writes it. The result does not prove that the
+    security exists. Raises InputError with code `invalid_symbol` for any other input.
 
     :param text: str; user input.
-    return symbol: Symbol; canonical identity such as `SH:600519`.
+    return symbol: Symbol; canonical identity such as `SH:600519` or `US:BRK-B`.
     """
     value = (text or "").strip()
     for pattern in _FORMS:
@@ -67,7 +77,14 @@ def parse_symbol(text: str) -> Symbol:
         if inferred is None or exchange != inferred:
             break
         return Symbol(symbol_id=f"{exchange}:{code}", exchange=exchange, code=code)  # type: ignore[arg-type]
-    raise InputError(make_issue("invalid_symbol", f"{text!r} is not a supported A-share symbol", "prices"))
+    for pattern in _US_FORMS:
+        match = pattern.fullmatch(value)
+        if match is not None:
+            code = match.group("ticker").upper()
+            if match.group("class"):
+                code += "-" + match.group("class").upper()
+            return Symbol(symbol_id=f"US:{code}", exchange="US", code=code)
+    raise InputError(make_issue("invalid_symbol", f"{text!r} is not a supported A-share or US symbol", "prices"))
 
 
 def build_bj_symbol(code: str) -> Symbol:

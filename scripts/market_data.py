@@ -1,9 +1,9 @@
-"""Command-line entry point for collecting and showing stored A-share market data.
+"""Command-line entry point for collecting and showing stored A-share and US share market data.
 
 Usage (from the project root):
     python -B scripts/market_data.py collect SYMBOL --json [--start DATE] [--end DATE] [--refresh]
         [--filing URI ...] [--db PATH] [--max-requests N]
-    python -B scripts/market_data.py show SYMBOL --json --dataset prices|statements|filings|coverage [...]
+    python -B scripts/market_data.py show SYMBOL --json --dataset prices|statements|filings|coverage|facts [...]
     python -B scripts/market_data.py config --json
 
 The command writes one JSON envelope to standard output and log lines to
@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -33,7 +34,7 @@ from stock_info.collector import build_envelope, build_error_envelope, collect, 
 from stock_info.filings import _LocalFileError, resolve_local_path  # noqa: E402
 from stock_info.providers import (  # noqa: E402
     FILING_HOSTS, CollectRequest, DateRange, FilingRef, HttpClient, InputError, Issue, QueryRequest, SourceError,
-    StorageError, Symbol, compute_china_day, make_issue, normalize_source_url, validate_remote_url,
+    StorageError, Symbol, compute_market_day, make_issue, normalize_source_url, validate_remote_url,
 )
 from stock_info.securities import parse_symbol  # noqa: E402
 from stock_info.settings import load_settings, summarize_settings  # noqa: E402
@@ -43,11 +44,14 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = "data/market-data.sqlite3"
 FLOOR_DATE = date(1970, 1, 1)
 EXIT_OK, EXIT_FATAL, EXIT_INPUT, EXIT_PARTIAL = 0, 1, 2, 3
+MAX_CONCEPTS = 50
+CONCEPT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_\-]{0,199}")
 DATASET_SELECTORS: dict[str, dict[str, Any]] = {
     "prices": {"providers": ("auto", "eastmoney", "tencent"), "allowed": {"adjustment", "versions"}},
-    "statements": {"providers": ("auto", "sina", "filing"), "allowed": {"scope", "kind", "versions"}},
-    "filings": {"providers": ("auto", "filing"), "allowed": {"versions"}},
-    "coverage": {"providers": ("auto", "eastmoney", "tencent", "sina", "filing", "bse"), "allowed": set()},
+    "statements": {"providers": ("auto", "sina", "filing", "sec"), "allowed": {"scope", "kind", "versions"}},
+    "filings": {"providers": ("auto", "filing", "sec"), "allowed": {"versions"}},
+    "coverage": {"providers": ("auto", "eastmoney", "tencent", "sina", "filing", "bse", "sec"), "allowed": set()},
+    "facts": {"providers": ("auto", "sec"), "allowed": {"versions", "concept", "filed_until"}},
 }
 
 
@@ -60,7 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     return parser: argparse.ArgumentParser; configured parser.
     """
-    parser = argparse.ArgumentParser(prog="market_data.py", description="Collect and show A-share market data.")
+    parser = argparse.ArgumentParser(prog="market_data.py",
+                                     description="Collect and show A-share and US share market data.")
     commands = parser.add_subparsers(dest="command", required=True)
     config = commands.add_parser("config", help="report the state of the private settings file")
     config.add_argument("--json", action="store_true", help="required; write a JSON object")
@@ -69,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("symbol", metavar="SYMBOL")
         sub.add_argument("--json", action="store_true", help="required; write a JSON envelope")
         sub.add_argument("--start", default=None, help="inclusive ISO start date, default 1970-01-01")
-        sub.add_argument("--end", default=None, help="inclusive ISO end date, default today in China")
+        sub.add_argument("--end", default=None, help="inclusive ISO end date, default today in the symbol's market")
         sub.add_argument("--db", default=None, help=f"root-relative database path, default {DEFAULT_DB}")
         if name == "collect":
             sub.add_argument("--refresh", action="store_true", help="bypass today's checks and recheck everything")
@@ -83,6 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--scope", default=None, choices=("all", "consolidated", "parent", "unknown"))
             sub.add_argument("--kind", default=None, choices=("all", "income", "balance", "cash_flow"))
             sub.add_argument("--versions", default=None, choices=("latest", "all"))
+            sub.add_argument("--concept", action="append", default=None, metavar="NAME",
+                             help="for --dataset facts: concept whose values to return; repeatable")
+            sub.add_argument("--filed-until", default=None, metavar="DATE",
+                             help="for --dataset facts: only values filed on or before this ISO date")
             sub.add_argument("--limit", type=int, default=None)
             sub.add_argument("--offset", type=int, default=None)
     return parser
@@ -101,13 +110,13 @@ def raise_input_error(code: str, message: str) -> None:
 def parse_range(start: str | None, end: str | None, today: date) -> DateRange:
     """Validate the inclusive ISO date range and return it.
 
-    The start defaults to 1970-01-01 and the end to today in China. Invalid,
-    reversed, and future dates raise InputError `invalid_range`. The floor is not a
-    listing date.
+    The start defaults to 1970-01-01 and the end to today in the symbol's market.
+    Invalid, reversed, and future dates raise InputError `invalid_range`. The floor
+    is not a listing date.
 
     :param start: str | None; ISO start date.
     :param end: str | None; ISO end date.
-    :param today: date; China calendar day.
+    :param today: date; calendar day in the symbol's market (New York for a US symbol, otherwise China).
     return span: DateRange; validated range.
     """
     try:
@@ -146,6 +155,7 @@ def build_filing_refs(values: list[str] | None, symbol: Symbol) -> tuple[FilingR
 
     At most five values are allowed. HTTPS values must name an allowed Sina or
     exchange filing host; other values must be local files under the project root.
+    Explicit filings exist for A-shares only; a US symbol with a value is rejected.
 
     :param values: list[str] | None; explicit URIs or paths.
     :param symbol: Symbol; requested symbol.
@@ -153,6 +163,9 @@ def build_filing_refs(values: list[str] | None, symbol: Symbol) -> tuple[FilingR
     """
     refs = []
     values = values or []
+    if values and symbol.exchange == "US":
+        raise_input_error("invalid_path", "--filing is not supported for US symbols; their reports are found"
+                          " through the SEC")
     if len(values) > 5:
         raise_input_error("invalid_path", "at most five --filing values are allowed")
     for value in values:
@@ -179,7 +192,9 @@ def build_query(args: argparse.Namespace, symbol: Symbol, span: DateRange) -> Qu
     """Validate show selectors against the dataset and return the query.
 
     Selectors that do not apply to the dataset are rejected even when they repeat a
-    default value. The limit must be 1 to 2,000 and the offset nonnegative.
+    default value. The limit must be 1 to 2,000 and the offset nonnegative. For
+    the dataset `facts`, at most 50 concept names are allowed, and `--filed-until`
+    must be an ISO date.
 
     :param args: argparse.Namespace; parsed show arguments.
     :param symbol: Symbol; requested symbol.
@@ -187,9 +202,21 @@ def build_query(args: argparse.Namespace, symbol: Symbol, span: DateRange) -> Qu
     return query: QueryRequest; validated query.
     """
     rules = DATASET_SELECTORS[args.dataset]
-    for name in ("adjustment", "scope", "kind", "versions"):
+    for name in ("adjustment", "scope", "kind", "versions", "concept", "filed_until"):
         if getattr(args, name) is not None and name not in rules["allowed"]:
-            raise_input_error("invalid_selector", f"--{name} does not apply to --dataset {args.dataset}")
+            raise_input_error("invalid_selector",
+                              f"--{name.replace('_', '-')} does not apply to --dataset {args.dataset}")
+    concepts = tuple(dict.fromkeys(args.concept or ()))
+    if len(concepts) > MAX_CONCEPTS or any(CONCEPT_NAME.fullmatch(name) is None for name in concepts):
+        raise_input_error("invalid_selector", f"--concept takes at most {MAX_CONCEPTS} names made of letters, digits,"
+                          " `_`, and `-`")
+    filed_until = None
+    if args.filed_until is not None:
+        try:
+            filed_until = date.fromisoformat(args.filed_until)
+        except ValueError:
+            raise InputError(make_issue("invalid_range", "--filed-until must use the ISO form YYYY-MM-DD",
+                                        "facts")) from None
     provider = args.provider or "auto"
     if provider not in rules["providers"]:
         raise_input_error("invalid_selector", f"--provider {provider} does not apply to --dataset {args.dataset}")
@@ -201,7 +228,8 @@ def build_query(args: argparse.Namespace, symbol: Symbol, span: DateRange) -> Qu
         raise_input_error("invalid_selector", "--offset must be nonnegative")
     return QueryRequest(symbol=symbol, span=span, dataset=args.dataset, provider=provider,
                         adjustment=args.adjustment or "raw", scope=args.scope or "all", kind=args.kind or "all",
-                        versions=args.versions or "latest", limit=limit, offset=offset)
+                        versions=args.versions or "latest", limit=limit, offset=offset, concepts=concepts,
+                        filed_until=filed_until)
 
 
 def write_json(envelope: Any) -> None:
@@ -264,7 +292,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_json(summary)
             return EXIT_INPUT if summary["status"] == "error" else EXIT_OK
         symbol = parse_symbol(args.symbol)
-        today = compute_china_day(clock())
+        today = compute_market_day(symbol.symbol_id, clock())
         span = parse_range(args.start, args.end, today)
         db_path = resolve_db_path(args.db)
         if args.command == "collect":

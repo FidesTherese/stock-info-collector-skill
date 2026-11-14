@@ -14,13 +14,13 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
 from .providers import (
-    CacheState, CheckKey, CheckSummary, CodeLink, Coverage, DateRange, DiscoveryResult, FetchResult, FilingResult,
-    Group, Interval, Issue, JsonValue, MappingResult, OutputRecord, Pagination, PriceRow, QueryPage, QueryRequest,
-    StatementRecord, StorageError, Symbol, compute_china_day, compute_sha256, convert_to_json, encode_canonical_json,
-    format_utc, hash_json, make_issue, parse_utc,
+    CacheState, CheckKey, CheckSummary, CodeLink, Coverage, DateRange, DiscoveryResult, FactRow, FetchResult,
+    FilingResult, Group, Interval, Issue, JsonValue, MappingResult, OutputRecord, Pagination, PriceRow, QueryPage,
+    QueryRequest, StatementRecord, StorageError, Symbol, compute_market_day, compute_sha256, convert_to_json,
+    encode_canonical_json, format_utc, hash_json, make_issue, parse_utc,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 OUTPUT_BYTE_BUDGET = 8 * 1024 * 1024 - 64 * 1024
 STALE_AFTER = timedelta(days=30)
 VALID_STATES = ("succeeded", "partial")
@@ -49,6 +49,16 @@ CREATE TABLE filings(check_id INTEGER PRIMARY KEY REFERENCES checks(id), uri TEX
 CREATE INDEX checks_lookup ON checks(symbol_id,provider,dataset,adjustment,resource,id);
 CREATE INDEX prices_date ON prices(trade_date);
 CREATE INDEX statements_date ON statements(report_date,kind,scope);
+"""
+# Schema version 2 adds the values that companies reported to the SEC. A version 1 database gets this
+# table when a writable store opens it.
+FACTS_SQL = """
+CREATE TABLE facts(check_id INTEGER NOT NULL REFERENCES checks(id), fact_key TEXT NOT NULL,
+ taxonomy TEXT NOT NULL, concept TEXT NOT NULL, label TEXT, unit TEXT NOT NULL, period_start TEXT,
+ period_end TEXT NOT NULL, accession TEXT NOT NULL, form TEXT, filed TEXT,
+ content_hash TEXT NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY(check_id, fact_key));
+CREATE INDEX facts_concept ON facts(concept, period_end);
+CREATE INDEX facts_key ON facts(fact_key);
 """
 _STATEMENT_DATASETS = ("income", "balance", "cash_flow")
 
@@ -103,13 +113,23 @@ def load_issue(value: Any) -> Issue:
 
 
 def compute_gate_key(key: CheckKey, day: date) -> str:
-    """Hash a check identity and a China day into the daily gate key and return it.
+    """Hash a check identity and a market day into the daily gate key and return it.
 
     :param key: CheckKey; task identity.
-    :param day: date; China calendar day.
+    :param day: date; market calendar day, see providers.compute_market_day.
     return gate_key: str; SHA-256 hex digest.
     """
     return hash_json([key, day])
+
+
+def compute_fact_key(record: FactRow) -> str:
+    """Hash the business identity of a reported value and return the fact key.
+
+    :param record: FactRow; reported value.
+    return fact_key: str; SHA-256 over group, concept, unit, period start, period end, and filing identifier.
+    """
+    return hash_json([record.taxonomy, record.concept, record.unit, record.period_start, record.period_end,
+                      record.accession])
 
 
 def compute_record_key(record: StatementRecord) -> str:
@@ -146,11 +166,14 @@ def encloses(outer: DateRange | None, inner: DateRange) -> bool:
 class Store:
     """Own one SQLite connection and provide gated checks, atomic finalization, and queries.
 
-    A writable store creates and initializes a new empty database, or opens a
-    database whose `user_version` is 1. Any other version raises StorageError
+    A writable store creates and initializes a new empty database, opens a
+    database whose `user_version` is 2, or upgrades a version 1 database by adding
+    the `facts` table. Any other version raises StorageError
     `schema_version_unsupported`. A read-only store opens with `mode=ro`, never
-    creates a file (missing file raises `database_not_found`), and keeps one read
-    transaction open until `close()` so that a show command sees one snapshot.
+    creates or upgrades a file (missing file raises `database_not_found`), accepts
+    versions 1 and 2, and keeps one read transaction open until `close()` so that
+    a show command sees one snapshot. `has_facts` is False only for a read-only
+    version 1 database; queries for reported values then return nothing.
     Methods must not be called concurrently.
 
     :param path: Path; database file path.
@@ -169,6 +192,7 @@ class Store:
         self.readonly = readonly
         self.new_revisions = 0
         self.reused_revisions = 0
+        self.has_facts = True
         self.conn: sqlite3.Connection = None  # type: ignore[assignment]
         try:
             if readonly:
@@ -193,18 +217,22 @@ class Store:
             raise
 
     def _verify_schema(self) -> None:
-        """Install the schema into an empty database or reject an unknown schema version.
+        """Install the schema into an empty database, upgrade version 1, or reject an unknown schema version.
 
         return None: None; no value is returned.
         """
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
         if version == SCHEMA_VERSION:
             return
+        if version == 1 and self.readonly:
+            self.has_facts = False
+            return
         tables = self.conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
-        if version == 0 and tables == 0 and not self.readonly:
+        if not self.readonly and (version == 1 or (version == 0 and tables == 0)):
+            script = FACTS_SQL if version == 1 else SCHEMA_SQL + FACTS_SQL
             self.conn.execute("BEGIN IMMEDIATE")
             try:
-                for statement in SCHEMA_SQL.split(";"):
+                for statement in script.split(";"):
                     if statement.strip():
                         self.conn.execute(statement)
                 self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -257,7 +285,8 @@ class Store:
                     refresh: bool = False) -> int | None:
         """Reserve today's check for a task and return its id, or None when today's gate is already used.
 
-        The gate key combines the task identity and the China day, so only one
+        The gate key combines the task identity and the market day (the New York
+        day for a US symbol or the SEC, otherwise the China day), so only one
         ordinary attempt per task and day can exist, whatever its outcome. With
         `refresh=True` the gate key is NULL and the reservation always succeeds. The
         row starts in state `running`; an interrupted run leaves it running, and such
@@ -272,7 +301,7 @@ class Store:
         """
         if self.readonly:
             raise StorageError(make_issue("storage_error", "read-only store cannot start checks", key.dataset))
-        day = compute_china_day(now)
+        day = compute_market_day(key.symbol_id, now, key.provider)
         gate = None if refresh else compute_gate_key(key, day)
         empty = encode_canonical_json(convert_to_json(Coverage(requested=span, traversal="running")))
         try:
@@ -300,13 +329,15 @@ class Store:
                      now: datetime) -> CheckSummary:
         """Store a task result and finalize its running check atomically, then return the summary.
 
-        The result kind must match the check dataset (prices and statements take a
-        FetchResult, mapping a MappingResult, discovery a DiscoveryResult, filing a
-        FilingResult whose reference URI equals the check resource). Records are
-        inserted with content hashes; a revision counts as reused when an earlier
+        The result kind must match the check dataset (prices, statements, and facts
+        take a FetchResult, mapping a MappingResult, discovery a DiscoveryResult,
+        filing a FilingResult whose reference URI equals the check resource). Records
+        are inserted with content hashes; a revision counts as reused when an earlier
         check of the same task stored the same content hash for the same business
         key. Unchanged code-link evidence only updates `last_seen` and `check_id`.
-        Any failure rolls back the whole transaction and raises StorageError.
+        Reported values (facts) are stored differently: only new and changed values
+        are inserted, see _insert_facts. Any failure rolls back the whole transaction
+        and raises StorageError.
 
         :param check_id: int; running check returned by start_check.
         :param result: FetchResult | MappingResult | DiscoveryResult | FilingResult; task outcome.
@@ -326,8 +357,17 @@ class Store:
             self.conn.execute("BEGIN IMMEDIATE")
             counts = [0, 0]
             metadata: JsonValue = result.metadata
+            issues = list(result.issues)
             if isinstance(result, FetchResult) and key.dataset == "prices":
                 self._insert_prices(check_id, key, result.records, counts)
+            elif isinstance(result, FetchResult) and key.dataset == "facts":
+                summary = self._insert_facts(check_id, key, result.records, counts)
+                base = result.metadata if isinstance(result.metadata, dict) else {}
+                metadata = {**base, **summary}
+                if summary["absent_keys"] and result.state == "succeeded":
+                    issues.append(make_issue(
+                        "values_missing_in_recheck", f"{summary['absent_keys']} stored values were not returned by"
+                        " this check; they are kept", "facts", severity="warning", provider=key.provider))
             elif isinstance(result, FetchResult):
                 self._insert_statements(check_id, key, result.records, counts)
             elif isinstance(result, MappingResult):
@@ -347,7 +387,7 @@ class Store:
                 "UPDATE checks SET finished_at=?, state=?, coverage_json=?, issues_json=?, metadata_json=?"
                 " WHERE id=? AND state='running'",
                 (format_utc(now), result.state, encode_canonical_json(convert_to_json(result.coverage)),
-                 encode_canonical_json(convert_to_json(result.issues)),
+                 encode_canonical_json(convert_to_json(issues)),
                  encode_canonical_json(convert_to_json(metadata)), check_id))
             self.conn.execute("COMMIT")
             self.new_revisions += counts[0]
@@ -373,11 +413,13 @@ class Store:
         return None: None; no value is returned.
         """
         expected: dict[str, type] = {"prices": FetchResult, "income": FetchResult, "balance": FetchResult,
-                                     "cash_flow": FetchResult, "mapping": MappingResult,
+                                     "cash_flow": FetchResult, "facts": FetchResult, "mapping": MappingResult,
                                      "discovery": DiscoveryResult, "filing": FilingResult}
-        ok = isinstance(result, expected[key.dataset])
+        ok = key.dataset in expected and isinstance(result, expected[key.dataset])
         if ok and key.dataset == "prices":
             ok = all(isinstance(r, PriceRow) for r in result.records)
+        elif ok and key.dataset == "facts":
+            ok = all(isinstance(r, FactRow) for r in result.records)
         elif ok and key.dataset in _STATEMENT_DATASETS:
             ok = all(isinstance(r, StatementRecord) and r.kind == key.dataset for r in result.records)
         elif ok and key.dataset == "filing":
@@ -420,6 +462,80 @@ class Store:
             counts[1 if reused else 0] += 1
             self.conn.execute("INSERT INTO prices(check_id, trade_date, content_hash, payload_json) VALUES (?,?,?,?)",
                               (check_id, day, content_hash, encode_canonical_json(payload)))
+
+    def _insert_facts(self, check_id: int, key: CheckKey, records: Sequence[FactRow],
+                      counts: list[int]) -> dict[str, JsonValue]:
+        """Insert the reported values that are new or changed for the symbol and return a storage summary.
+
+        A company has tens of thousands of reported values and they rarely change,
+        so a check stores only the values whose content differs from the newest
+        stored version of the same fact key. The newest stored row of a key is its
+        latest version. A stored value that this check did not return stays stored
+        and is counted. Two different values with the same key in one check both
+        stay: the later one gets a key that also covers its content.
+
+        Output summary: `stored_rows: int` (new and changed values inserted),
+        `unchanged_rows: int` (values equal to the stored version), and
+        `absent_keys: int` (stored keys that this check did not return).
+
+        :param check_id: int; check id.
+        :param key: CheckKey; task identity.
+        :param records: Sequence[FactRow]; validated values of one response.
+        :param counts: list[int]; [new, reused] counters to update.
+        return summary: dict[str, JsonValue]; counts following the output summary above.
+        """
+        known: dict[str, str] = {}
+        sql = ("SELECT f.fact_key, f.content_hash FROM facts f JOIN checks c ON c.id=f.check_id"
+               " WHERE c.symbol_id IS ? AND c.provider=? AND c.dataset='facts' ORDER BY f.check_id")
+        for row in self.conn.execute(sql, (key.symbol_id, key.provider)):
+            known[row["fact_key"]] = row["content_hash"]
+        seen: set[str] = set()
+        inserts: list[tuple[Any, ...]] = []
+        unchanged = 0
+        for record in records:
+            payload = convert_to_json(record)
+            fact_key = compute_fact_key(record)
+            content_hash = hash_json([key.symbol_id, key.provider, fact_key, payload])
+            if fact_key in seen:
+                fact_key = hash_json([fact_key, content_hash])
+                if fact_key in seen:
+                    continue
+            seen.add(fact_key)
+            if known.get(fact_key) == content_hash:
+                unchanged += 1
+                continue
+            inserts.append((check_id, fact_key, record.taxonomy, record.concept, record.label, record.unit,
+                            record.period_start.isoformat() if record.period_start else None,
+                            record.period_end.isoformat(), record.accession, record.form,
+                            record.filed.isoformat() if record.filed else None, content_hash,
+                            encode_canonical_json(payload)))
+        self.conn.executemany(
+            "INSERT INTO facts(check_id, fact_key, taxonomy, concept, label, unit, period_start, period_end,"
+            " accession, form, filed, content_hash, payload_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", inserts)
+        counts[0] += len(inserts)
+        counts[1] += unchanged
+        return {"stored_rows": len(inserts), "unchanged_rows": unchanged, "absent_keys": len(set(known) - seen)}
+
+    def list_fact_filings(self, symbol: Symbol) -> list[tuple[str, str | None, str | None, str, str, int]]:
+        """List the filings named by the stored reported values of a symbol and return one row per period and group.
+
+        The rows feed sec.plan_sec_filings, which derives the periodic reports of
+        the company and estimates each report's period end.
+
+        :param symbol: Symbol; US symbol.
+        return rows: list[tuple[str, str | None, str | None, str, str, int]]; (filing identifier, form, filing
+            date as ISO text, period end as ISO text, group, number of values); empty when nothing is stored.
+        """
+        if not self.has_facts:
+            return []
+        sql = ("SELECT f.accession, f.form, f.filed, f.period_end, f.taxonomy, COUNT(DISTINCT f.fact_key) AS n"
+               " FROM facts f JOIN checks c ON c.id=f.check_id WHERE c.symbol_id=? AND c.provider='sec'"
+               " AND c.dataset='facts' GROUP BY f.accession, f.form, f.filed, f.period_end, f.taxonomy")
+        try:
+            return [(row["accession"], row["form"], row["filed"], row["period_end"], row["taxonomy"], row["n"])
+                    for row in self.conn.execute(sql, (symbol.symbol_id,))]
+        except sqlite3.Error as exc:
+            raise self._wrap(exc) from None
 
     def _insert_statements(self, check_id: int, key: CheckKey, records: Sequence[StatementRecord],
                            counts: list[int]) -> None:
@@ -564,9 +680,12 @@ class Store:
                     groups.extend(self._plan_statement_groups(symbol, request, now))
                 elif request.dataset == "filings":
                     groups.append(self._plan_filing_group(symbol, request, now, builder.issues))
+                elif request.dataset == "facts":
+                    groups.extend(self._plan_fact_groups(symbol, request, now))
                 else:
                     groups.extend(self._plan_coverage_groups(symbol, request, now))
-            if request.dataset == "coverage" and request.provider in ("auto", "bse"):
+            if request.dataset == "coverage" and request.provider in ("auto", "bse") \
+                    and request.symbol.exchange != "US":
                 groups.extend(self._plan_coverage_groups(None, request, now))
             for group, produce in groups:
                 if produce is None or builder.done:
@@ -610,8 +729,9 @@ class Store:
         """Build a group header from its checks and selection and return it.
 
         Freshness is `never_fetched` without checks; `fresh` when a succeeded check
-        from today's China day covers the span and no later attempt failed; otherwise
-        `stale`. A last success older than 30 days is always stale.
+        from today's market day covers the span and no later attempt failed; otherwise
+        `stale`. A last success older than 30 days is always stale. The market day is
+        the New York day for a US symbol or the SEC, otherwise the China day.
 
         :param symbol_id: str | None; group symbol.
         :param provider: str; group provider.
@@ -632,9 +752,9 @@ class Store:
         if not checks:
             freshness = "never_fetched"
         else:
-            today = compute_china_day(now)
+            today = compute_market_day(symbol_id, now, provider)
             fresh = (last_success is not None and last_success.finished_at is not None
-                     and compute_china_day(last_success.finished_at) == today
+                     and compute_market_day(symbol_id, last_success.finished_at, provider) == today
                      and (last_success.span is None or encloses(last_success.span, span) or dataset == "filing")
                      and all(c.state in VALID_STATES or c.state == "running"
                              for c in finished if c.check_id > last_success.check_id)
@@ -676,7 +796,7 @@ class Store:
         span, adjustment = request.span, request.adjustment
         providers = ["eastmoney", "tencent"] if request.provider == "auto" else [request.provider]
         by_provider = {p: self._load_checks(symbol.symbol_id, p, "prices", adjustment) for p in providers}
-        today = compute_china_day(now)
+        today = compute_market_day(symbol.symbol_id, now)
 
         def usable(check: CheckSummary) -> bool:
             """Report whether a check is a finished, valid, non-empty price snapshot for this request.
@@ -696,7 +816,7 @@ class Store:
         candidates = {p: [c for c in checks if usable(c)] for p, checks in by_provider.items()}
         for provider in providers:
             fresh = [c for c in candidates[provider] if c.state == "succeeded" and encloses(c.span, span)
-                     and c.finished_at and compute_china_day(c.finished_at) == today]
+                     and c.finished_at and compute_market_day(symbol.symbol_id, c.finished_at) == today]
             if fresh:
                 selected, reason, chosen = fresh[-1], "fresh_covering", provider
                 break
@@ -745,7 +865,7 @@ class Store:
         :param provider: str; provider.
         :param selected: CheckSummary; selected enclosing snapshot.
         :param request: QueryRequest; validated query.
-        :param today: date; China day for the provisional flag.
+        :param today: date; market day for the provisional flag.
         return records: Iterator[OutputRecord]; price records.
         """
         if request.versions == "latest":
@@ -778,7 +898,7 @@ class Store:
         :param provider: str; provider.
         :param selected: CheckSummary; selected check.
         :param request: QueryRequest; validated query.
-        :param today: date; China day for the provisional flag.
+        :param today: date; market day for the provisional flag.
         :param issues: list[Issue]; page issue list for missing_in_recheck.
         return records: Iterator[OutputRecord]; price records.
         """
@@ -807,12 +927,14 @@ class Store:
 
     def _plan_statement_groups(self, symbol: Symbol, request: QueryRequest,
                                now: datetime) -> list[tuple[Group, Callable[[], Iterator[OutputRecord]] | None]]:
-        """Plan one group per statement kind and provider (Sina and filings) for one symbol.
+        """Plan one group per statement kind and provider for one symbol.
 
-        Sina groups select the latest valid check. Filing groups aggregate filing
-        documents and have no single selected check: `latest` uses only the latest
-        valid read of each document URI (so a re-read supersedes records whose
-        locators changed), while `all` returns every observed record.
+        An A-share has the providers `sina` and `filing`; a US symbol has the
+        provider `sec`, whose statements come from SEC report pages. Sina groups
+        select the latest valid check. Document groups (`filing` and `sec`)
+        aggregate filing documents and have no single selected check: `latest` uses
+        only the latest valid read of each document URI (so a re-read supersedes
+        records whose locators changed), while `all` returns every observed record.
 
         :param symbol: Symbol; symbol.
         :param request: QueryRequest; validated query.
@@ -820,7 +942,10 @@ class Store:
         return groups: list[tuple[Group, Callable | None]]; planned groups.
         """
         kinds = list(_STATEMENT_DATASETS) if request.kind == "all" else [request.kind]
-        providers = ["sina", "filing"] if request.provider == "auto" else [request.provider]
+        if request.provider == "auto":
+            providers = ["sec"] if symbol.exchange == "US" else ["sina", "filing"]
+        else:
+            providers = [request.provider]
         planned: list[tuple[Group, Callable[[], Iterator[OutputRecord]] | None]] = []
         for kind in kinds:
             for provider in providers:
@@ -832,11 +957,11 @@ class Store:
                     check_sql = ("c.symbol_id=? AND c.provider='sina' AND c.dataset=? AND c.id<=?",
                                  [symbol.symbol_id, kind, selected.check_id if selected else 0])
                 else:
-                    checks = self._load_checks(symbol.symbol_id, "filing", "filing")
+                    checks = self._load_checks(symbol.symbol_id, provider, "filing")
                     valid = [c for c in checks if c.finished_at and c.state in VALID_STATES]
                     selected, reason = None, "all_filing_documents" if valid else "no_usable_check"
-                    check_sql = ("c.symbol_id=? AND c.provider='filing' AND c.dataset='filing' AND s.kind=?",
-                                 [symbol.symbol_id, kind])
+                    check_sql = ("c.symbol_id=? AND c.provider=? AND c.dataset='filing' AND s.kind=?",
+                                 [symbol.symbol_id, provider, kind])
                     if request.versions == "latest":
                         latest_ids = sorted({max(c.check_id for c in valid if c.key.resource == uri)
                                              for uri in {c.key.resource for c in valid}})
@@ -844,7 +969,7 @@ class Store:
                         check_sql = (check_sql[0] + f" AND c.id IN ({marks})", [*check_sql[1], *latest_ids])
                 group = self._describe_group(symbol.symbol_id, provider, kind, "none", "", checks, selected, reason,
                                              request.span, now)
-                if provider == "filing" and valid:
+                if provider != "sina" and valid:
                     group["state"] = "partial" if any(c.state != "succeeded" for c in valid) else "succeeded"
                 if not valid:
                     planned.append((group, None))
@@ -859,7 +984,7 @@ class Store:
         Records are ordered by report date, scope, source key, then observation.
 
         :param symbol: Symbol; symbol.
-        :param provider: str; `sina` or `filing`.
+        :param provider: str; `sina`, `filing`, or `sec`.
         :param check_sql: tuple[str, list[Any]]; SQL condition on checks and its parameters.
         :param request: QueryRequest; validated query.
         return producer: Callable[[], Iterator[OutputRecord]]; generator function.
@@ -898,9 +1023,10 @@ class Store:
                            issues: list[Issue]) -> tuple[Group, Callable[[], Iterator[OutputRecord]] | None]:
         """Plan the filing-document group for one symbol and return it.
 
-        `latest` returns the last attempt per URI; `all` returns every attempt. The
-        date filter uses the reference report date; documents with an unknown date
-        are kept and counted in a warning.
+        The documents of an A-share have the provider `filing`; those of a US symbol
+        have the provider `sec`. `latest` returns the last attempt per URI; `all`
+        returns every attempt. The date filter uses the reference report date;
+        documents with an unknown date are kept and counted in a warning.
 
         :param symbol: Symbol; symbol.
         :param request: QueryRequest; validated query.
@@ -908,8 +1034,9 @@ class Store:
         :param issues: list[Issue]; page issue list.
         return group: tuple[Group, Callable | None]; planned group.
         """
-        checks = [c for c in self._load_checks(symbol.symbol_id, "filing", "filing") if c.finished_at]
-        group = self._describe_group(symbol.symbol_id, "filing", "filing", "none", "", checks, None,
+        provider = request.provider if request.provider != "auto" else ("sec" if symbol.exchange == "US" else "filing")
+        checks = [c for c in self._load_checks(symbol.symbol_id, provider, "filing") if c.finished_at]
+        group = self._describe_group(symbol.symbol_id, provider, "filing", "none", "", checks, None,
                                      "all_filing_documents" if checks else "never_fetched", request.span, now)
         if not checks:
             return group, None
@@ -921,12 +1048,12 @@ class Store:
             """
             sql = ("SELECT f.*, c.id AS cid, c.state, c.coverage_json, c.issues_json, c.metadata_json AS cmeta,"
                    " c.finished_at FROM filings f JOIN checks c ON c.id=f.check_id WHERE c.symbol_id=?"
-                   " AND c.provider='filing' AND c.dataset='filing' AND c.finished_at IS NOT NULL ORDER BY f.uri,"
+                   " AND c.provider=? AND c.dataset='filing' AND c.finished_at IS NOT NULL ORDER BY f.uri,"
                    " c.id DESC")
             selected: list[dict[str, Any]] = []
             unknown = 0
             current_uri = None
-            for row in self.conn.execute(sql, (symbol.symbol_id,)):
+            for row in self.conn.execute(sql, (symbol.symbol_id, provider)):
                 if request.versions == "latest" and row["uri"] == current_uri:
                     continue
                 current_uri = row["uri"]
@@ -939,7 +1066,7 @@ class Store:
                 selected.append({
                     "sort": (report_date or "", row["uri"], row["cid"]),
                     "record": OutputRecord(
-                        type="filing", check_id=row["cid"], symbol_id=symbol.symbol_id, provider="filing",
+                        type="filing", check_id=row["cid"], symbol_id=symbol.symbol_id, provider=provider,
                         record_key=str(row["cid"]), content_hash=row["body_sha256"],
                         first_observed_at=row["finished_at"], last_observed_at=row["finished_at"],
                         observation_count=1,
@@ -950,11 +1077,86 @@ class Store:
             if unknown:
                 issues.append(make_issue("filing_report_date_unknown",
                                          f"{unknown} filing documents have no report date and are included", "filing",
-                                         severity="warning", symbol=symbol, provider="filing"))
+                                         severity="warning", symbol=symbol,
+                                         provider=provider))  # type: ignore[arg-type]
             for item in sorted(selected, key=lambda i: i["sort"]):
                 yield item["record"]
 
         return group, produce
+
+    def _plan_fact_groups(self, symbol: Symbol, request: QueryRequest,
+                          now: datetime) -> list[tuple[Group, Callable[[], Iterator[OutputRecord]] | None]]:
+        """Plan the reported-values group of one symbol and return it.
+
+        Without concepts in the request, the group yields one `concept` record per
+        concept and unit. Its data: `taxonomy`, `concept`, `label` (str or null),
+        `unit`, `value_count` (int), `first_period_end`, `last_period_end`, and
+        `last_filed` (ISO dates; `last_filed` may be null).
+
+        With concepts, the group yields one `fact` record per value of those
+        concepts; its data is the stored FactRow as JSON. Values are ordered by
+        concept, period end, filing date, and fact key. `latest` returns the newest
+        stored version of each value; `all` returns every stored version.
+
+        Both forms keep only values whose period end lies in the requested range
+        and, when `filed_until` is set, whose filing date is not later than it.
+
+        :param symbol: Symbol; symbol.
+        :param request: QueryRequest; validated query with `concepts` and `filed_until`.
+        :param now: datetime; aware UTC time.
+        return groups: list[tuple[Group, Callable | None]]; one planned group.
+        """
+        checks = self._load_checks(symbol.symbol_id, "sec", "facts")
+        valid = [c for c in checks if c.finished_at and c.state in VALID_STATES]
+        selected = valid[-1] if valid else None
+        group = self._describe_group(symbol.symbol_id, "sec", "facts", "none", "", checks, selected,
+                                     "latest_valid" if selected else "no_usable_check", request.span, now)
+        if selected is None or selected.finished_at is None or not self.has_facts:
+            return [(group, None)]
+        scope = ("c.symbol_id=? AND c.provider='sec' AND c.dataset='facts' AND c.state IN ('succeeded','partial')"
+                 " AND c.finished_at IS NOT NULL AND f.period_end BETWEEN ? AND ?")
+        params: list[Any] = [symbol.symbol_id, request.span.start.isoformat(), request.span.end.isoformat()]
+        if request.filed_until is not None:
+            scope += " AND f.filed<=?"
+            params.append(request.filed_until.isoformat())
+        check_id, stamp = selected.check_id, format_utc(selected.finished_at)
+
+        def produce_concepts() -> Iterator[OutputRecord]:
+            """Yield one summary record per concept and unit.
+
+            return records: Iterator[OutputRecord]; concept records.
+            """
+            sql = ("SELECT f.taxonomy, f.concept, f.unit, MAX(f.label) AS label, COUNT(DISTINCT f.fact_key) AS n,"
+                   " MIN(f.period_end) AS first_end, MAX(f.period_end) AS last_end, MAX(f.filed) AS last_filed"
+                   f" FROM facts f JOIN checks c ON c.id=f.check_id WHERE {scope}"
+                   " GROUP BY f.taxonomy, f.concept, f.unit ORDER BY f.taxonomy, f.concept, f.unit")
+            for row in self.conn.execute(sql, params):
+                data: dict[str, JsonValue] = {
+                    "taxonomy": row["taxonomy"], "concept": row["concept"], "label": row["label"],
+                    "unit": row["unit"], "value_count": row["n"], "first_period_end": row["first_end"],
+                    "last_period_end": row["last_end"], "last_filed": row["last_filed"]}
+                yield OutputRecord(type="concept", check_id=check_id, symbol_id=symbol.symbol_id, provider="sec",
+                                   record_key=f"{row['taxonomy']}:{row['concept']}:{row['unit']}", content_hash=None,
+                                   first_observed_at=stamp, last_observed_at=stamp, observation_count=1, data=data)
+
+        def produce_values() -> Iterator[OutputRecord]:
+            """Yield the stored values of the requested concepts.
+
+            return records: Iterator[OutputRecord]; fact records.
+            """
+            marks = ",".join("?" for _ in request.concepts)
+            sql = ("SELECT f.check_id, c.finished_at, f.fact_key AS bkey, f.content_hash, f.payload_json FROM facts f"
+                   f" JOIN checks c ON c.id=f.check_id WHERE {scope} AND f.concept IN ({marks})"
+                   " ORDER BY f.concept, f.period_end, f.filed, f.fact_key, f.check_id DESC")
+            for bkey, versions in _group_versions(self.conn.execute(sql, [*params, *request.concepts])):
+                for version in (versions[:1] if request.versions == "latest" else versions):
+                    yield OutputRecord(type="fact", check_id=version["check_id"], symbol_id=symbol.symbol_id,
+                                       provider="sec", record_key=bkey, content_hash=version["content_hash"],
+                                       first_observed_at=version["first"], last_observed_at=version["last"],
+                                       observation_count=version["count"],
+                                       data=json.loads(version["payload_json"]))
+
+        return [(group, produce_values if request.concepts else produce_concepts)]
 
     def _plan_coverage_groups(self, symbol: Symbol | None, request: QueryRequest,
                               now: datetime) -> list[tuple[Group, Callable[[], Iterator[OutputRecord]] | None]]:
@@ -969,7 +1171,7 @@ class Store:
         return groups: list[tuple[Group, Callable | None]]; planned groups sorted by task identity.
         """
         provider = None if request.provider == "auto" else request.provider
-        datasets = ["prices", "income", "balance", "cash_flow", "discovery", "filing", "mapping"]
+        datasets = ["prices", "income", "balance", "cash_flow", "discovery", "filing", "mapping", "facts"]
         symbol_id = symbol.symbol_id if symbol else None
         checks = self._load_checks(symbol_id, provider, datasets)
         by_key: dict[CheckKey, list[CheckSummary]] = {}

@@ -14,14 +14,22 @@
 
 ## What This Project Does
 
-This project is an agent skill. It collects historical information about one Shanghai, Shenzhen, or Beijing A-share symbol and saves it in a local SQLite database:
+This project is an agent skill. It collects historical information about one listed company at a time and saves it in a local SQLite database.
+
+For a Shanghai, Shenzhen, or Beijing A-share symbol:
 
 - daily unadjusted and forward-adjusted prices from Eastmoney, with Tencent as a separate fallback source;
 - balance sheets, income statements, and cash-flow statements from Sina;
 - parent-company statements extracted from periodic reports (HTML pages and text PDFs) found on Sina;
 - official old-code to new-code mappings for Beijing Stock Exchange listings.
 
-The database keeps every version that the collector observed. The JSON output always says which data is missing, stale, or unverified. An AI agent uses the skill through [`SKILL.md`](SKILL.md).
+For a US-listed symbol:
+
+- daily unadjusted and forward-adjusted prices from Eastmoney, with Tencent as a fallback for unadjusted prices only;
+- every financial value that the company reported to the US Securities and Exchange Commission (SEC), with the date on which each value was filed;
+- the income statement, balance sheet, and cash-flow statement of each annual and quarterly report, as the report presented them.
+
+The database keeps the versions that the collector observed. The JSON output always says which data is missing, stale, or unverified. An AI agent uses the skill through [`SKILL.md`](SKILL.md).
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -36,7 +44,7 @@ python -m venv .venv
 
 On macOS or Linux, use `python3 -m venv .venv` and `.venv/bin/python -m pip install -r requirements.txt`.
 
-No API key is needed. A-share collection needs no settings at all. The [Settings](#settings) section describes the one private file that access to the US regulator's data will need.
+No API key is needed. A-share collection needs no settings at all. US company data from the SEC needs one private file with your contact details; the [Settings](#settings) section describes it.
 
 [↑ Back to Table of Contents](#table-of-contents)
 
@@ -44,7 +52,7 @@ No API key is needed. A-share collection needs no settings at all. The [Settings
 
 The US Securities and Exchange Commission (SEC) asks every automated tool to state who operates it: a name and an e-mail address. The collector reads these details from a private file named `config.toml` in this directory. The repository contains only an empty template, [`config.example.toml`](config.example.toml). It never contains anyone's details, and the source code contains none either.
 
-US share collection, which will use these details, is not implemented yet. Today the details are read by the `config` command, and by the HTTP client before a request to an SEC server.
+Without these details the collector still collects US prices, but it collects no SEC data and reports the issue `sec_contact_missing`. The SEC states that its filing content is free to access and reuse, and that scripted access is allowed up to 10 requests per second; the collector sends at most 4.
 
 **Each person uses their own details.** Follow these steps in order:
 
@@ -91,6 +99,13 @@ Collect one year of data for Kweichow Moutai, then read the stored raw prices:
 .\.venv\Scripts\python -B scripts\market_data.py show 600519 --json --dataset prices --start 2025-01-01 --end 2025-12-31
 ```
 
+Collect Apple from 2024, then read its net income as it was known at the end of 2025:
+
+```powershell
+.\.venv\Scripts\python -B scripts\market_data.py collect AAPL --json --start 2024-01-01
+.\.venv\Scripts\python -B scripts\market_data.py show AAPL --json --dataset facts --concept NetIncomeLoss --filed-until 2025-12-31
+```
+
 The collect command prints a JSON summary and exits with 0 when everything it attempted succeeded, or 3 when some data is missing. Read [`SKILL.md`](SKILL.md) for every option, the meaning of the JSON fields, and the exit codes.
 
 [↑ Back to Table of Contents](#table-of-contents)
@@ -119,12 +134,18 @@ The tests use fake HTTP responses and temporary databases. They never contact a 
 
 ## Known Limits
 
-- Source reuse conditions are not established. Use collected data locally and do not redistribute it.
+- The reuse conditions of Eastmoney, Tencent, and Sina are not established. Use their data locally and do not redistribute it. The SEC states that its filing content is free to access and reuse.
 - The sources do not guarantee complete history. An empty result is never proof that no trading or reporting happened.
 - Scanned (image-only) PDF filings are reported as unreadable; there is no OCR.
 - Shanghai and Shenzhen code changes are not resolved, because no official mapping source is configured.
 - Text extraction from real report PDFs usually rejects the tables as ambiguous. The collector therefore reads a PDF attachment only when its HTML page yielded no statement.
 - A statement whose page-break pieces do not line up is rejected rather than saved partially. A rejected consolidated statement is only a warning when Sina's structured data covers the same periods; a rejected parent-company statement makes the collect `partial`.
+- US reports are found through the values that the SEC's company-data service holds. Those values start in 2009, hold standard items only, and may miss reports of some foreign companies.
+- US report pages from before about late 2011 use an older format that the collector does not read. Such a report is listed as unreadable; its figures are still among the reported values.
+- US statements keep the numbers as displayed, with the page's unit note such as "$ in Millions". The collector does not multiply them.
+- A US fund has prices only. Earlier tickers of a renamed US company are not traced. Tencent has no forward-adjusted US prices.
+- The first collection of a large US company stores tens of thousands of values and can add 20 to 40 MB to the database.
+- The US sources were checked live on 2026-11-14 for five symbols: a Nasdaq share, two NYSE shares, a foreign company, and a fund.
 - The sources were checked live on 2026-11-13 for one Shanghai, one Shenzhen, and one Beijing symbol. Their page formats can change without notice.
 
 [↑ Back to Table of Contents](#table-of-contents)

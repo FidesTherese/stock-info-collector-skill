@@ -118,10 +118,14 @@ class FakeSession:
 def make_client(session: FakeSession, **kwargs: Any) -> HttpClient:
     """Create an HttpClient that uses the fake session and never sleeps, and return it.
 
+    The fake session also serves requests to SEC hosts, so a test can never reach
+    the real SEC, even when its options carry a contact line.
+
     :param session: FakeSession; fake session.
     :param kwargs: Any; extra HttpClient options.
     return client: HttpClient; client for tests.
     """
+    kwargs.setdefault("sec_session_factory", lambda: session)
     return HttpClient(session_factory=lambda: session, sleep=lambda _s: None, **kwargs)
 
 
@@ -255,7 +259,7 @@ class SharedRecordTests(unittest.TestCase):
         for text in ("sh600519", "600519.SH", "SH:600519", "600519", " SH600519 "):
             self.assertEqual(parse_symbol(text), SH)
         self.assertEqual(parse_symbol("920000").symbol_id, "BJ:920000")
-        for bad in ("sz600519", "900000", "60051", "AAPL", ""):
+        for bad in ("sz600519", "900000", "60051", "AAPL1", ""):
             with self.assertRaises(InputError) as ctx:
                 parse_symbol(bad)
             self.assertEqual(ctx.exception.issue.code, "invalid_symbol")

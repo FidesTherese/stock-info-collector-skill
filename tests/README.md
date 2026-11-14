@@ -26,5 +26,8 @@ This directory contains the automated `unittest` suite for the code in [`scripts
 | `test_filings.py` | GBK index discovery, HTML parent statements, identity checks, table geometry, a real pypdf extraction from an inline ToUnicode PDF, PDF failures, and local path limits. |
 | `test_collector.py` | A full collect run, same-day reuse, next-day recheck, refresh, Tencent fallback, Beijing aliases and conflicts, parent gaps, interruption, and storage failure. |
 | `test_cli.py` | JSON envelope keys, input validation, exit codes, collect-then-show, read-only show, the `config` command, and the script run as a subprocess. |
+| `test_us.py` | US symbol forms, the New York day around both clock changes, the venue search for US prices, the limits of the Tencent fallback, the request gap for SEC hosts, the storage and queries of reported values, the schema upgrade, and the New York gate. |
+| `test_sec.py` | The SEC ticker list, the parsing of reported values, the planning of reports with their estimated period end, the choice of statement pages by title, and the reading of report pages modelled on real ones. |
+| `test_us_collect.py` | A whole US collection in a fake world: task order, reuse on the same day, a missing contact, the request budget, the Tencent fallback, and the US selectors of the command line. |
 
 [↑ Back to Table of Contents](#table-of-contents)

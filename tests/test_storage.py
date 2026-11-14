@@ -115,11 +115,11 @@ class SchemaTests(StoreTestCase):
     """Check schema installation and version handling."""
 
     def test_schema_foreign_keys_and_version(self) -> None:
-        """A new database has six tables, version 1, and enforced foreign keys."""
+        """A new database has seven tables, version 2, and enforced foreign keys."""
         conn = sqlite3.connect(self.path)
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertEqual(tables, {"securities", "checks", "code_links", "prices", "statements", "filings"})
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+        self.assertEqual(tables, {"securities", "checks", "code_links", "prices", "statements", "filings", "facts"})
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
         conn.close()
         with self.assertRaises(sqlite3.IntegrityError):
             self.store.conn.execute("INSERT INTO prices VALUES (999, '2025-01-01', 'h', '{}')")

@@ -19,6 +19,6 @@ This directory holds internal design records for the project's developers. They 
 | `specification.md` | General specification: purpose, scope, requirements, terms, and repository structure for the whole project. |
 | `spec-stock-info-collector.md` and `dtd-stock-info-collector.md` | Requirements and technical design of A-share collection. |
 | `spec-local-settings.md` and `dtd-local-settings.md` | Requirements and technical design of the private settings file that holds the SEC contact details. |
-| `spec-us-share-collection.md` | Provisional requirements and research record for US share collection, which is not implemented yet. |
+| `spec-us-share-collection.md` and `dtd-us-share-collection.md` | Requirements, research record, and technical design of US share collection. |
 
 [↑ Back to Table of Contents](#table-of-contents)

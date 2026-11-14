@@ -89,7 +89,7 @@ class ValidationTests(CliTestCase):
     def test_invalid_input_exits_2_with_envelope(self) -> None:
         """Bad symbols, ranges, selectors, and a missing --json flag give exit 2 and an error envelope."""
         cases = [
-            (["collect", "AAPL", "--json"], "invalid_symbol"),
+            (["collect", "AAPL1", "--json"], "invalid_symbol"),
             (["collect", "600519", "--json", "--start", "2025-02-01", "--end", "2025-01-01"], "invalid_range"),
             (["collect", "600519", "--json", "--end", "2999-01-01"], "invalid_range"),
             (["collect", "600519"], "invalid_selector"),

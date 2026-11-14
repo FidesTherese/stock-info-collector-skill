@@ -1,7 +1,8 @@
 """Shared records, errors, bounded HTTP access, and the price and statement adapters.
 
 Every other module imports its shared types from this module. The module never
-performs input or output at import time.
+performs input or output at import time. The price adapters serve A-shares and
+US shares; the statement adapter in this module serves A-shares only.
 """
 
 from __future__ import annotations
@@ -18,13 +19,14 @@ from html.parser import HTMLParser
 from typing import Any, Callable, Literal, Sequence, TypeAlias, TypedDict
 from urllib.parse import urlencode, urljoin, urlsplit
 
-Exchange: TypeAlias = Literal["SH", "SZ", "BJ"]
+Exchange: TypeAlias = Literal["SH", "SZ", "BJ", "US"]
 Adjustment: TypeAlias = Literal["raw", "forward", "none"]
 PriceProvider: TypeAlias = Literal["eastmoney", "tencent"]
-Provider: TypeAlias = Literal["eastmoney", "tencent", "sina", "filing", "bse"]
+Provider: TypeAlias = Literal["eastmoney", "tencent", "sina", "filing", "bse", "sec"]
 StatementKind: TypeAlias = Literal["income", "balance", "cash_flow"]
 Scope: TypeAlias = Literal["consolidated", "parent", "unknown"]
-Dataset: TypeAlias = Literal["prices", "income", "balance", "cash_flow", "discovery", "filing", "mapping", "settings"]
+Dataset: TypeAlias = Literal["prices", "income", "balance", "cash_flow", "discovery", "filing", "mapping", "facts",
+                             "settings"]
 State: TypeAlias = Literal["running", "succeeded", "partial", "failed", "blocked"]
 JsonValue: TypeAlias = None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
 UtcClock: TypeAlias = Callable[[], datetime]
@@ -36,6 +38,7 @@ MAPPING_MAX_BYTES = 2 * MIB
 HTML_MAX_BYTES = 8 * MIB
 PDF_MAX_BYTES = 16 * MIB
 TOTAL_MAX_BYTES = 128 * MIB
+SEC_FACTS_MAX_BYTES = 64 * MIB
 FIELD_MAX_BYTES = 64 * 1024
 REPORT_MAX_ITEMS = 1000
 TENCENT_MAX_PAGES = 64
@@ -59,6 +62,9 @@ EASTMONEY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 TENCENT_URL = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
 SINA_REPORT_URL = "https://quotes.sina.cn/cn/api/openapi.php/CompanyFinanceService.getFinanceReport2022"
 SINA_SOURCES: dict[str, str] = {"income": "lrb", "balance": "fzb", "cash_flow": "llb"}
+# Eastmoney serves US securities under three venue numbers; Tencent needs a matching code suffix.
+US_VENUES: tuple[str, ...] = ("105", "106", "107")
+TENCENT_US_SUFFIX: dict[str, str] = {"105": "OQ", "106": "N", "107": "AM"}
 
 
 # ---------------------------------------------------------------------------
@@ -68,14 +74,16 @@ SINA_SOURCES: dict[str, str] = {"income": "lrb", "balance": "fzb", "cash_flow": 
 
 @dataclass(frozen=True)
 class Symbol:
-    """Identify one A-share security by exchange and six-digit code and return the identity record.
+    """Identify one security by market and code and return the identity record.
 
-    The canonical identifier is `EXCHANGE:CODE`, for example `SH:600519`. The record
-    does not prove that the security exists or trades.
+    The canonical identifier is `EXCHANGE:CODE`, for example `SH:600519` or
+    `US:AAPL`. An A-share code has six digits. A US code is the ticker in upper
+    case, with `-` before a share class as the SEC writes it, for example `BRK-B`.
+    The record does not prove that the security exists or trades.
 
-    :param symbol_id: str; canonical identifier such as `SH:600519`.
-    :param exchange: Exchange; `SH`, `SZ`, or `BJ`.
-    :param code: str; six-digit exchange code.
+    :param symbol_id: str; canonical identifier such as `SH:600519` or `US:BRK-B`.
+    :param exchange: Exchange; `SH`, `SZ`, `BJ`, or `US`.
+    :param code: str; six-digit A-share code, or US ticker.
     return instance: Symbol; immutable security identity.
     """
 
@@ -85,9 +93,11 @@ class Symbol:
 
     @property
     def wire_code(self) -> str:
-        """Build the lowercase prefixed code that Tencent and Sina expect and return it.
+        """Build the lowercase prefixed code that Tencent and Sina expect for A-shares and return it.
 
-        The wire code joins the lowercase exchange and the code, for example `sh600519`.
+        The wire code joins the lowercase exchange and the code, for example
+        `sh600519`. US requests do not use it: they need a venue, see
+        build_eastmoney_secid and build_tencent_code.
 
         return wire_code: str; provider-facing prefixed code.
         """
@@ -309,6 +319,45 @@ class PriceRow:
 
 
 @dataclass(frozen=True)
+class FactRow:
+    """Hold one financial value that a company reported to the SEC, with the filing that reported it.
+
+    The same period can appear in several filings, for example as a comparative
+    figure one year later. Each appearance is its own row with its own filing date,
+    so a reader can select only the values that were public on a chosen day.
+
+    :param taxonomy: str; group of the concept, such as `us-gaap`, `ifrs-full`, or `dei`.
+    :param concept: str; concept name, such as `NetIncomeLoss`.
+    :param label: str | None; SEC label of the concept, or None when the SEC gives none.
+    :param unit: str; unit of the value, such as `USD`, `shares`, or `USD/shares`.
+    :param period_start: date | None; first day of the period, or None for a value at one moment.
+    :param period_end: date; last day of the period, or the moment of the value.
+    :param value: str; exact decimal text of the value, never rounded.
+    :param accession: str; SEC identifier of the filing, such as `0000320193-26-000026`.
+    :param fiscal_year: int | None; fiscal year of the filing, or None.
+    :param fiscal_period: str | None; fiscal period of the filing, such as `FY` or `Q2`, or None.
+    :param form: str | None; form type of the filing, such as `10-K`, or None.
+    :param filed: date | None; day on which the filing became public, or None.
+    :param frame: str | None; SEC calendar-frame label such as `CY2026Q1`, or None.
+    return instance: FactRow; immutable reported value.
+    """
+
+    taxonomy: str
+    concept: str
+    label: str | None
+    unit: str
+    period_start: date | None
+    period_end: date
+    value: str
+    accession: str
+    fiscal_year: int | None
+    fiscal_period: str | None
+    form: str | None
+    filed: date | None
+    frame: str | None
+
+
+@dataclass(frozen=True)
 class StatementItem:
     """Hold one statement line item without zero-filling missing values.
 
@@ -427,16 +476,16 @@ class FilingRef:
 
 @dataclass(frozen=True)
 class FetchResult:
-    """Return the outcome of one price or statement traversal.
+    """Return the outcome of one price, statement, or reported-values traversal.
 
-    `records` is homogeneous: only PriceRow or only StatementRecord values.
+    `records` is homogeneous: only PriceRow, only StatementRecord, or only FactRow values.
 
     :param state: State; succeeded, partial, failed, or blocked.
     :param coverage: Coverage; visited and unvisited ranges.
     :param requests: tuple[RequestMeta, ...]; HTTP attempts.
     :param issues: tuple[Issue, ...]; warnings and errors.
     :param metadata: JsonValue; bounded provider metadata.
-    :param records: tuple[PriceRow | StatementRecord, ...]; accepted records.
+    :param records: tuple[PriceRow | StatementRecord | FactRow, ...]; accepted records.
     return instance: FetchResult; immutable traversal outcome.
     """
 
@@ -590,7 +639,7 @@ class QueryRequest:
 
     :param symbol: Symbol; requested symbol.
     :param span: DateRange; inclusive query range.
-    :param dataset: Literal["prices", "statements", "filings", "coverage"]; data to return.
+    :param dataset: Literal["prices", "statements", "filings", "coverage", "facts"]; data to return.
     :param provider: str; `auto` or a provider name allowed for the dataset.
     :param adjustment: Literal["raw", "forward"]; price adjustment.
     :param scope: Literal["all", "consolidated", "parent", "unknown"]; statement scope filter.
@@ -598,12 +647,15 @@ class QueryRequest:
     :param versions: Literal["latest", "all"]; latest values or every observed version.
     :param limit: int; maximum records to return; 0 returns group summaries only.
     :param offset: int; number of records to skip.
+    :param concepts: tuple[str, ...]; for the dataset `facts`: concept names whose values to return; empty
+        returns one summary record per concept and unit instead of values.
+    :param filed_until: date | None; for the dataset `facts`: return only values filed on or before this day.
     return instance: QueryRequest; immutable query request.
     """
 
     symbol: Symbol
     span: DateRange
-    dataset: Literal["prices", "statements", "filings", "coverage"]
+    dataset: Literal["prices", "statements", "filings", "coverage", "facts"]
     provider: str = "auto"
     adjustment: Literal["raw", "forward"] = "raw"
     scope: Literal["all", "consolidated", "parent", "unknown"] = "all"
@@ -611,6 +663,8 @@ class QueryRequest:
     versions: Literal["latest", "all"] = "latest"
     limit: int = 200
     offset: int = 0
+    concepts: tuple[str, ...] = ()
+    filed_until: date | None = None
 
 
 class Stats(TypedDict):
@@ -801,6 +855,53 @@ def compute_china_day(value: datetime) -> date:
     return day: date; China calendar day.
     """
     return value.astimezone(CHINA_TZ).date()
+
+
+def _find_sunday(year: int, month: int, ordinal: int) -> int:
+    """Find the day of the month of the first, second, or later Sunday and return it.
+
+    :param year: int; calendar year.
+    :param month: int; calendar month, 1 to 12.
+    :param ordinal: int; 1 for the first Sunday, 2 for the second, and so on.
+    return day: int; day of the month.
+    """
+    first_weekday = date(year, month, 1).weekday()  # Monday is 0, Sunday is 6
+    return 1 + (6 - first_weekday) % 7 + 7 * (ordinal - 1)
+
+
+def compute_new_york_day(value: datetime) -> date:
+    """Convert an aware timestamp to the calendar day in New York and return it.
+
+    New York is four hours behind UTC from 07:00 UTC on the second Sunday of March
+    until 06:00 UTC on the first Sunday of November, and five hours behind UTC
+    otherwise. This is the rule in force since 2007. The function is meant for
+    current dates; it does not know older rules. It needs no time-zone database.
+
+    :param value: datetime; aware timestamp.
+    return day: date; New York calendar day.
+    """
+    moment = value.astimezone(timezone.utc)
+    summer_start = datetime(moment.year, 3, _find_sunday(moment.year, 3, 2), 7, tzinfo=timezone.utc)
+    summer_end = datetime(moment.year, 11, _find_sunday(moment.year, 11, 1), 6, tzinfo=timezone.utc)
+    hours = 4 if summer_start <= moment < summer_end else 5
+    return (moment - timedelta(hours=hours)).date()
+
+
+def compute_market_day(symbol_id: str | None, value: datetime, provider: str = "") -> date:
+    """Convert an aware timestamp to the calendar day of the market that a check belongs to and return it.
+
+    A US symbol and the provider `sec` use the New York day. Every other check,
+    including the global Beijing code-mapping check, uses the China day. The market
+    day gates the once-a-day check, decides freshness, and marks today's price row.
+
+    :param symbol_id: str | None; canonical symbol such as `US:AAPL`, or None for a global check.
+    :param value: datetime; aware timestamp.
+    :param provider: str; provider of the check; only `sec` changes the result.
+    return day: date; New York or China calendar day.
+    """
+    if provider == "sec" or (symbol_id or "").startswith("US:"):
+        return compute_new_york_day(value)
+    return compute_china_day(value)
 
 
 def convert_to_json(value: Any) -> JsonValue:
@@ -1364,9 +1465,10 @@ class HttpClient:
     """Perform bounded, sequential HTTPS GET requests and return complete bodies.
 
     The client counts every attempt, redirect, and retry against `max_requests`,
-    enforces a run deadline, a per-request timeout, a one-second gap between request
-    starts, per-response and total byte limits, and at most three validated
-    redirects. Connection failures, timeouts, and HTTP 408/500/502/503/504 are retried
+    enforces a run deadline, a per-request timeout, a gap between request starts
+    (one second, or a quarter of a second before a request to an SEC host, which
+    stays below the SEC's limit of ten requests per second), per-response and total
+    byte limits, and at most three validated redirects. Connection failures, timeouts, and HTTP 408/500/502/503/504 are retried
     once after two seconds. HTTP 429 cools the host for the rest of the run. Failures
     raise SourceError carrying the attempts. The client is not thread-safe.
 
@@ -1381,6 +1483,7 @@ class HttpClient:
     :param run_seconds: float; run deadline in seconds.
     :param request_timeout: float; timeout per attempt in seconds.
     :param start_gap: float; minimum seconds between request starts.
+    :param sec_start_gap: float; minimum seconds before the start of a request to an SEC host.
     :param retry_delay: float; seconds before the single retry.
     :param total_bytes: int; total body bytes allowed for the run.
     :param session_factory: Callable[[], Any] | None; creates the HTTP session; tests inject fakes.
@@ -1393,7 +1496,8 @@ class HttpClient:
     """
 
     def __init__(self, *, max_requests: int = 256, run_seconds: float = 900.0, request_timeout: float = 12.0,
-                 start_gap: float = 1.0, retry_delay: float = 2.0, total_bytes: int = TOTAL_MAX_BYTES,
+                 start_gap: float = 1.0, sec_start_gap: float = 0.25, retry_delay: float = 2.0,
+                 total_bytes: int = TOTAL_MAX_BYTES,
                  session_factory: Callable[[], Any] | None = None,
                  sec_access: Callable[[], SecAccess] | None = None,
                  sec_session_factory: Callable[[], Any] | None = None,
@@ -1406,6 +1510,7 @@ class HttpClient:
         self.max_requests = max_requests
         self.request_timeout = request_timeout
         self.start_gap = start_gap
+        self.sec_start_gap = sec_start_gap
         self.retry_delay = retry_delay
         self.total_bytes = total_bytes
         self._session_factory = session_factory or create_default_session
@@ -1544,9 +1649,10 @@ class HttpClient:
         if self.attempts >= self.max_requests:
             raise SourceError(self._issue("budget_exhausted", "request budget is exhausted", url, retryable=True),
                               tuple(metas))
+        gap = self.sec_start_gap if sec_line is not None else self.start_gap
         now = self._monotonic()
-        if self._last_start is not None and now < self._last_start + self.start_gap:
-            self._sleep(self._last_start + self.start_gap - now)
+        if self._last_start is not None and now < self._last_start + gap:
+            self._sleep(self._last_start + gap - now)
         if self._monotonic() >= self._deadline:
             raise SourceError(self._issue("work_limit", "run deadline reached", url, retryable=True), tuple(metas))
         self.attempts += 1
@@ -1718,57 +1824,110 @@ def decide_state(accepted: int, had_error: bool, complete: bool) -> State:
 
 
 def fetch_prices(http: HttpClient, symbol: Symbol, span: DateRange, adjustment: Adjustment,
-                 provider: PriceProvider, *, today: date | None = None) -> FetchResult:
+                 provider: PriceProvider, *, today: date | None = None, venues: Sequence[str] = ()) -> FetchResult:
     """Collect daily bars for one symbol, range, adjustment, and provider and return the traversal result.
 
     Eastmoney is requested in calendar-year windows; Tencent is paged backwards with
     a date cursor. Accepted pages are kept when a later page fails. Forward-adjusted
     traversals re-request the page with the earliest row and compare its OHLC values;
     a mismatch adds `adjustment_mismatch` and makes the result partial so it is never
-    promoted. Rows after the China-local `today` are rejected.
+    promoted. Rows after the market-local `today` are rejected.
+
+    US symbols need a venue. Eastmoney serves a US security under one of the venue
+    numbers in `US_VENUES`; the adapter tries `venues` in order (all three when
+    `venues` is empty) and keeps the first that knows the code. Tencent needs
+    exactly one venue, because a wrong one returns misleading rows, and it serves
+    only unadjusted US prices. A Tencent task that breaks either rule returns a
+    failed result with the issue `fallback_unavailable` and makes no request. The
+    metadata of a US result holds the venue in use under the key `venue`.
 
     :param http: HttpClient; bounded HTTP client.
     :param symbol: Symbol; security to collect.
     :param span: DateRange; inclusive range.
     :param adjustment: Adjustment; `raw` or `forward`.
     :param provider: PriceProvider; `eastmoney` or `tencent`.
-    :param today: date | None; China-local day used to reject future rows; defaults to now.
+    :param today: date | None; market-local day used to reject future rows; defaults to now.
+    :param venues: Sequence[str]; for a US symbol: venue numbers to try, such as `("105", "106")`.
     return result: FetchResult; records are PriceRow values sorted by trade_date.
     """
     if adjustment not in ("raw", "forward"):
         raise ValueError("price adjustment must be raw or forward")
-    today = today or compute_china_day(datetime.now(timezone.utc))
+    today = today or compute_market_day(symbol.symbol_id, datetime.now(timezone.utc))
+    is_us = symbol.exchange == "US"
     if provider == "eastmoney":
-        return _fetch_eastmoney(http, symbol, span, adjustment, today)
+        return _fetch_eastmoney(http, symbol, span, adjustment, today, tuple(venues or US_VENUES) if is_us else ())
     if provider == "tencent":
-        return _fetch_tencent(http, symbol, span, adjustment, today)
+        if not is_us:
+            return _fetch_tencent(http, symbol, span, adjustment, today)
+        if adjustment != "raw" or len(venues) != 1 or venues[0] not in TENCENT_US_SUFFIX:
+            reason = ("Tencent has no forward-adjusted US prices" if adjustment != "raw"
+                      else "the Tencent fallback needs the one venue that Eastmoney confirmed")
+            issue = make_issue("fallback_unavailable", reason, "prices", symbol=symbol, provider="tencent")
+            coverage = Coverage(requested=span, unfetched=(span,), traversal="failed")
+            return FetchResult(state="failed", coverage=coverage, requests=(), issues=(issue,), metadata={})
+        return _fetch_tencent(http, symbol, span, adjustment, today, venues[0])
     raise ValueError(f"unknown price provider {provider}")
 
 
-def _build_eastmoney_url(symbol: Symbol, window: DateRange, adjustment: Adjustment) -> str:
+def build_eastmoney_secid(symbol: Symbol, venue: str | None = None) -> str:
+    """Build the Eastmoney security identifier `MARKET.CODE` and return it.
+
+    Shanghai uses market 1; Shenzhen and Beijing use market 0. A US symbol uses the
+    given venue number, and its code has `_` before a share class (`106.BRK_B`).
+
+    :param symbol: Symbol; security.
+    :param venue: str | None; US venue number such as `105`; ignored for A-shares.
+    return secid: str; identifier such as `1.600519` or `105.AAPL`.
+    """
+    if symbol.exchange == "US":
+        return f"{venue}.{symbol.code.replace('-', '_')}"
+    return f"{'1' if symbol.exchange == 'SH' else '0'}.{symbol.code}"
+
+
+def build_tencent_code(symbol: Symbol, venue: str | None = None) -> str:
+    """Build the code that Tencent expects and return it.
+
+    An A-share uses its wire code (`sh600519`). A US symbol uses `us`, the ticker
+    with `.` before a share class, and the suffix of its venue (`usBRK.B.N`).
+
+    :param symbol: Symbol; security.
+    :param venue: str | None; US venue number, a key of TENCENT_US_SUFFIX; ignored for A-shares.
+    return code: str; Tencent code.
+    """
+    if symbol.exchange == "US":
+        return f"us{symbol.code.replace('-', '.')}.{TENCENT_US_SUFFIX[venue or '']}"
+    return symbol.wire_code
+
+
+def _build_eastmoney_url(symbol: Symbol, window: DateRange, adjustment: Adjustment, venue: str | None = None) -> str:
     """Build the Eastmoney daily K-line URL for one window and return it.
 
     :param symbol: Symbol; security.
     :param window: DateRange; inclusive window.
     :param adjustment: Adjustment; raw (fqt=0) or forward (fqt=1).
+    :param venue: str | None; US venue number; None for A-shares.
     return url: str; request URL.
     """
-    market = "1" if symbol.exchange == "SH" else "0"
-    params = {"secid": f"{market}.{symbol.code}", "klt": "101", "fqt": "1" if adjustment == "forward" else "0",
+    params = {"secid": build_eastmoney_secid(symbol, venue), "klt": "101",
+              "fqt": "1" if adjustment == "forward" else "0",
               "beg": window.start.strftime("%Y%m%d"), "end": window.end.strftime("%Y%m%d"),
               "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55,f56,f57"}
     return f"{EASTMONEY_URL}?{urlencode(params)}"
 
 
 def _parse_eastmoney_page(body: bytes, symbol: Symbol, window: DateRange, adjustment: Adjustment,
-                          today: date) -> tuple[list[PriceRow], JsonValue]:
+                          today: date, venue: str | None = None) -> tuple[list[PriceRow], JsonValue]:
     """Validate one Eastmoney response and return its rows and metadata, or raise _PageError.
+
+    Eastmoney answers `rc=100` with `data: null` when it does not know the code in
+    the requested market; this raises _PageError with the code `symbol_not_found`.
 
     :param body: bytes; response body.
     :param symbol: Symbol; requested security.
     :param window: DateRange; requested window.
     :param adjustment: Adjustment; requested adjustment.
-    :param today: date; China-local day for the future-row check.
+    :param today: date; market-local day for the future-row check.
+    :param venue: str | None; US venue number that was requested; None for A-shares.
     return page: tuple[list[PriceRow], JsonValue]; rows and metadata without klines.
     """
     try:
@@ -1777,6 +1936,9 @@ def _parse_eastmoney_page(body: bytes, symbol: Symbol, window: DateRange, adjust
         raise _PageError("schema_changed", f"Eastmoney body is not strict JSON: {exc}") from None
     if not isinstance(payload, dict) or "rc" not in payload:
         raise _PageError("schema_changed", "Eastmoney body has no rc field")
+    secid = build_eastmoney_secid(symbol, venue)
+    if payload.get("rc") == 100 and payload.get("data") is None:
+        raise _PageError("symbol_not_found", f"Eastmoney does not know {secid}")
     if payload.get("rc") != 0:
         raise _PageError("provider_error", f"Eastmoney rc={payload.get('rc')!r}")
     data = payload.get("data")
@@ -1784,8 +1946,7 @@ def _parse_eastmoney_page(body: bytes, symbol: Symbol, window: DateRange, adjust
         return [], {"data": None}
     if not isinstance(data, dict) or not isinstance(data.get("klines"), list) or not isinstance(data.get("code"), str):
         raise _PageError("schema_changed", "Eastmoney data lacks code or klines")
-    expected_market = 1 if symbol.exchange == "SH" else 0
-    if data.get("code") != symbol.code or data.get("market") != expected_market:
+    if isinstance(data.get("market"), bool) or f"{data.get('market')}.{data.get('code')}" != secid:
         raise _PageError("identity_mismatch", f"Eastmoney returned {data.get('market')}.{data.get('code')}")
     rows: list[PriceRow] = []
     seen: set[date] = set()
@@ -1833,15 +1994,20 @@ class _PageError(Exception):
 
 
 def _fetch_eastmoney(http: HttpClient, symbol: Symbol, span: DateRange, adjustment: Adjustment,
-                     today: date) -> FetchResult:
+                     today: date, venues: tuple[str, ...] = ()) -> FetchResult:
     """Traverse Eastmoney calendar-year windows and return the price result.
+
+    For a US symbol the first window is requested for each venue in `venues` until
+    one knows the code; that venue then serves every later window. When no venue
+    knows the code, the result is failed with the issue `symbol_not_found`.
 
     :param http: HttpClient; bounded client.
     :param symbol: Symbol; security.
     :param span: DateRange; inclusive range.
     :param adjustment: Adjustment; raw or forward.
-    :param today: date; China-local day.
-    return result: FetchResult; Eastmoney price outcome.
+    :param today: date; market-local day.
+    :param venues: tuple[str, ...]; US venue numbers to try in order; empty for A-shares.
+    return result: FetchResult; Eastmoney price outcome; the metadata of a US result holds `venue`.
     """
     windows = split_calendar_years(span)
     rows: list[PriceRow] = []
@@ -1850,19 +2016,34 @@ def _fetch_eastmoney(http: HttpClient, symbol: Symbol, span: DateRange, adjustme
     issues: list[Issue] = []
     page_meta: list[JsonValue] = []
     failed_at: int | None = None
+    venue: str | None = None
     for index, window in enumerate(windows):
-        url = _build_eastmoney_url(symbol, window, adjustment)
-        try:
-            response = http.get(url, max_bytes=API_MAX_BYTES)
-            requests.extend(response.requests)
-            page_rows, meta = _parse_eastmoney_page(response.body, symbol, window, adjustment, today)
-        except SourceError as exc:
-            requests.extend(exc.requests)
-            issues.append(relabel_issue(exc.issue, "prices", symbol, "eastmoney"))
-            failed_at = index
+        candidates: tuple[str | None, ...] = venues if venues and venue is None else (venue,)
+        problem: Issue | None = None
+        page_rows: list[PriceRow] = []
+        meta: JsonValue = None
+        for candidate in candidates:
+            url = _build_eastmoney_url(symbol, window, adjustment, candidate)
+            try:
+                response = http.get(url, max_bytes=API_MAX_BYTES)
+                requests.extend(response.requests)
+                page_rows, meta = _parse_eastmoney_page(response.body, symbol, window, adjustment, today, candidate)
+            except SourceError as exc:
+                requests.extend(exc.requests)
+                problem = relabel_issue(exc.issue, "prices", symbol, "eastmoney")
+                break
+            except _PageError as exc:
+                if exc.code == "symbol_not_found" and candidate != candidates[-1]:
+                    continue
+                message = str(exc)
+                if exc.code == "symbol_not_found" and len(candidates) > 1:
+                    message = f"Eastmoney does not know {symbol.code} in the venues {', '.join(map(str, candidates))}"
+                problem = make_issue(exc.code, message, "prices", symbol=symbol, provider="eastmoney", url=url)
+                break
+            venue = candidate
             break
-        except _PageError as exc:
-            issues.append(make_issue(exc.code, str(exc), "prices", symbol=symbol, provider="eastmoney", url=url))
+        if problem is not None:
+            issues.append(problem)
             failed_at = index
             break
         rows.extend(page_rows)
@@ -1872,11 +2053,11 @@ def _fetch_eastmoney(http: HttpClient, symbol: Symbol, span: DateRange, adjustme
     if complete and adjustment == "forward" and rows:
         anchor = rows[0]
         window = next(w for w in windows if w.start <= anchor.trade_date <= w.end)
-        url = _build_eastmoney_url(symbol, window, adjustment)
+        url = _build_eastmoney_url(symbol, window, adjustment, venue)
         try:
             response = http.get(url, max_bytes=API_MAX_BYTES)
             requests.extend(response.requests)
-            recheck, _meta = _parse_eastmoney_page(response.body, symbol, window, adjustment, today)
+            recheck, _meta = _parse_eastmoney_page(response.body, symbol, window, adjustment, today, venue)
             if not recheck or _ohlc(recheck[0]) != _ohlc(anchor) or recheck[0].trade_date != anchor.trade_date:
                 issues.append(make_issue("adjustment_mismatch", "forward-adjusted anchor changed during traversal",
                                          "prices", symbol=symbol, provider="eastmoney", url=url, retryable=True))
@@ -1892,8 +2073,11 @@ def _fetch_eastmoney(http: HttpClient, symbol: Symbol, span: DateRange, adjustme
     unfetched = windows[failed_at:] if failed_at is not None else []
     state = decide_state(len(fetched), bool(issues), complete)
     coverage = summarize_coverage(span, fetched, unfetched, [r.trade_date for r in rows], state)
+    metadata: dict[str, JsonValue] = {"pages": page_meta[:1], "page_count": len(page_meta)}
+    if symbol.exchange == "US":
+        metadata["venue"] = venue
     return FetchResult(state=state, coverage=coverage, requests=tuple(requests), issues=tuple(issues),
-                       metadata=bound_metadata({"pages": page_meta[:1], "page_count": len(page_meta)}, 2 * MIB),
+                       metadata=bound_metadata(metadata, 2 * MIB),
                        records=tuple(sorted(rows, key=lambda r: r.trade_date)))
 
 
@@ -1906,30 +2090,33 @@ def _ohlc(row: PriceRow) -> tuple[str, str, str, str]:
     return row.open, row.high, row.low, row.close
 
 
-def _build_tencent_url(symbol: Symbol, cursor: date, adjustment: Adjustment) -> str:
+def _build_tencent_url(symbol: Symbol, cursor: date, adjustment: Adjustment, venue: str | None = None) -> str:
     """Build the Tencent backward-paging K-line URL and return it.
 
     :param symbol: Symbol; security.
     :param cursor: date; latest date to include in this page.
     :param adjustment: Adjustment; raw (empty flag) or forward (`qfq`).
+    :param venue: str | None; US venue number; None for A-shares.
     return url: str; request URL.
     """
     flag = "qfq" if adjustment == "forward" else ""
-    param = f"{symbol.wire_code},day,,{cursor.isoformat()},{TENCENT_PAGE_SIZE},{flag}"
+    param = f"{build_tencent_code(symbol, venue)},day,,{cursor.isoformat()},{TENCENT_PAGE_SIZE},{flag}"
     return f"{TENCENT_URL}?{urlencode({'param': param})}"
 
 
 def _parse_tencent_page(body: bytes, symbol: Symbol, cursor: date, adjustment: Adjustment,
-                        today: date) -> list[PriceRow]:
+                        today: date, venue: str | None = None) -> list[PriceRow]:
     """Validate one Tencent page and return its rows (unfiltered by the span), or raise _PageError.
 
     :param body: bytes; response body, which may be labelled text/html but must be strict JSON.
     :param symbol: Symbol; requested security.
     :param cursor: date; latest date requested.
     :param adjustment: Adjustment; raw uses key `day`, forward uses key `qfqday`.
-    :param today: date; China-local day.
+    :param today: date; market-local day.
+    :param venue: str | None; US venue number; None for A-shares.
     return rows: list[PriceRow]; rows in the page.
     """
+    code = build_tencent_code(symbol, venue)
     try:
         payload = parse_strict_json(body)
     except (ValueError, UnicodeDecodeError) as exc:
@@ -1938,9 +2125,9 @@ def _parse_tencent_page(body: bytes, symbol: Symbol, cursor: date, adjustment: A
         code = payload.get("code") if isinstance(payload, dict) else None
         raise _PageError("provider_error", f"Tencent code={code!r}")
     data = payload.get("data")
-    if not isinstance(data, dict) or not isinstance(data.get(symbol.wire_code), dict):
-        raise _PageError("identity_mismatch", f"Tencent data lacks {symbol.wire_code}")
-    series = data[symbol.wire_code]
+    if not isinstance(data, dict) or not isinstance(data.get(code), dict):
+        raise _PageError("identity_mismatch", f"Tencent data lacks {code}")
+    series = data[code]
     key = "qfqday" if adjustment == "forward" else "day"
     other = "day" if adjustment == "forward" else "qfqday"
     if key not in series:
@@ -1974,14 +2161,14 @@ def _parse_tencent_page(body: bytes, symbol: Symbol, cursor: date, adjustment: A
             amount = cells[8] if kind == "number" else None
         try:
             rows.append(build_price_row(cells, trade_date, cells[1], cells[2], cells[3], cells[4], cells[5], amount,
-                                        symbol.wire_code, adjustment))
+                                        code, adjustment))
         except ValueError as exc:
             raise _PageError("schema_changed", f"Tencent row {trade_date}: {exc}") from None
     return rows
 
 
 def _fetch_tencent(http: HttpClient, symbol: Symbol, span: DateRange, adjustment: Adjustment,
-                   today: date) -> FetchResult:
+                   today: date, venue: str | None = None) -> FetchResult:
     """Page Tencent backwards from the end of the range and return the price result.
 
     The cursor moves to the day before the earliest unfiltered row. Short pages
@@ -1991,8 +2178,9 @@ def _fetch_tencent(http: HttpClient, symbol: Symbol, span: DateRange, adjustment
     :param symbol: Symbol; security.
     :param span: DateRange; inclusive range.
     :param adjustment: Adjustment; raw or forward.
-    :param today: date; China-local day.
-    return result: FetchResult; Tencent price outcome.
+    :param today: date; market-local day.
+    :param venue: str | None; US venue number; None for A-shares.
+    return result: FetchResult; Tencent price outcome; the metadata of a US result holds `venue`.
     """
     cursor = min(span.end, today)
     rows: dict[date, PriceRow] = {}
@@ -2006,12 +2194,12 @@ def _fetch_tencent(http: HttpClient, symbol: Symbol, span: DateRange, adjustment
         if cursor < span.start:
             complete = True
             break
-        url = _build_tencent_url(symbol, cursor, adjustment)
+        url = _build_tencent_url(symbol, cursor, adjustment, venue)
         pages += 1
         try:
             response = http.get(url, max_bytes=API_MAX_BYTES)
             requests.extend(response.requests)
-            page = _parse_tencent_page(response.body, symbol, cursor, adjustment, today)
+            page = _parse_tencent_page(response.body, symbol, cursor, adjustment, today, venue)
         except SourceError as exc:
             requests.extend(exc.requests)
             issues.append(relabel_issue(exc.issue, "prices", symbol, "tencent"))
@@ -2049,12 +2237,12 @@ def _fetch_tencent(http: HttpClient, symbol: Symbol, span: DateRange, adjustment
                                  symbol=symbol, provider="tencent", retryable=True))
     ordered = sorted(rows.values(), key=lambda r: r.trade_date)
     if complete and adjustment == "forward" and ordered and anchor_cursor is not None:
-        url = _build_tencent_url(symbol, anchor_cursor, adjustment)
+        url = _build_tencent_url(symbol, anchor_cursor, adjustment, venue)
         try:
             response = http.get(url, max_bytes=API_MAX_BYTES)
             requests.extend(response.requests)
             recheck = {r.trade_date: r for r in _parse_tencent_page(response.body, symbol, anchor_cursor,
-                                                                     adjustment, today)}
+                                                                     adjustment, today, venue)}
             again = recheck.get(ordered[0].trade_date)
             if again is None or _ohlc(again) != _ohlc(ordered[0]):
                 issues.append(make_issue("adjustment_mismatch", "forward-adjusted anchor changed during traversal",
@@ -2076,8 +2264,11 @@ def _fetch_tencent(http: HttpClient, symbol: Symbol, span: DateRange, adjustment
             unfetched.append(DateRange(span.start, end))
     state = decide_state(len(fetched), bool(issues), complete)
     coverage = summarize_coverage(span, fetched, unfetched, [r.trade_date for r in ordered], state)
+    metadata: dict[str, JsonValue] = {"page_count": pages}
+    if symbol.exchange == "US":
+        metadata["venue"] = venue
     return FetchResult(state=state, coverage=coverage, requests=tuple(requests), issues=tuple(issues),
-                       metadata={"page_count": pages}, records=tuple(ordered))
+                       metadata=metadata, records=tuple(ordered))
 
 
 # ---------------------------------------------------------------------------

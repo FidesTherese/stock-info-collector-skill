@@ -2,7 +2,8 @@
 
 The collector decides which source tasks are due, runs them one at a time, saves
 each outcome through storage.Store, and builds the JSON envelope. It never runs
-SQL or parses provider bodies itself.
+SQL or parses provider bodies itself. A-shares and US shares have separate task
+orders and share the ending that builds the envelope.
 """
 
 from __future__ import annotations
@@ -17,20 +18,24 @@ from typing import Any, Callable
 
 from .filings import discover_filings, read_filing
 from .providers import (
-    CacheState, CheckKey, CheckSummary, CollectRequest, CommandResult, Coverage, DateRange, FilingRef, FilingResult,
-    Group,
-    HttpClient, InputError, Interval, Issue, QueryRequest, StatementKind, Stats, Symbol, UtcClock,
-    compute_china_day, convert_to_json, fetch_prices, fetch_statements, make_issue,
+    US_VENUES, CacheState, CheckKey, CheckSummary, CodeLink, CollectRequest, CommandResult, Coverage, DateRange,
+    FilingRef, FilingResult, Group, HttpClient, InputError, Interval, Issue, QueryRequest, StatementKind, Stats,
+    Symbol, UtcClock, compute_china_day, compute_market_day, convert_to_json, fetch_prices, fetch_statements,
+    make_issue,
 )
+from .sec import fetch_sec_facts, lookup_sec_company, plan_sec_filings, read_sec_filing
 from .securities import lookup_code_links, resolve_symbols
 from .storage import Store, summarize_horizon
 
 LOGGER = logging.getLogger("stock_info")
 MAX_DOCUMENTS = 24
+# Reading one SEC report takes at most four requests: the summary and three statement pages.
+SEC_REPORT_REQUESTS = 4
 DOCUMENT_RECHECK = timedelta(days=30)
 STATEMENT_KINDS: tuple[StatementKind, ...] = ("income", "balance", "cash_flow")
 PARTIAL_CODES = frozenset({"missing_parent_statements", "filing_discovery_failed", "mapping_conflict",
-                           "budget_exhausted", "work_limit", "interrupted_check", "parent_coverage_unverified"})
+                           "budget_exhausted", "work_limit", "interrupted_check", "parent_coverage_unverified",
+                           "forward_fallback_unavailable", "price_fallback_unavailable"})
 
 
 def log_event(level: int, event: str, **fields: Any) -> None:
@@ -146,16 +151,12 @@ def _latest(checks: tuple[CheckSummary, ...] | list[CheckSummary], key: CheckKey
 
 
 def collect(store: Store, http: HttpClient, request: CollectRequest, clock: UtcClock) -> CommandResult:
-    """Collect prices, statements, filings, and mappings for one symbol and return the command envelope.
+    """Collect prices, financial information, and mappings for one symbol and return the command envelope.
 
-    Order: Beijing code mapping (global daily check, Beijing symbols only), alias
-    resolution from verified links, then for the requested symbol and each alias:
-    raw and forward prices from Eastmoney (with a separate full-range Tencent task
-    when the whole Eastmoney task failed or returned no rows), Sina income, balance,
-    and cash-flow statements, filing discovery, and up to 24 filing documents
-    including PDF attachments. Each task is saved before the next starts. A source
-    failure lets later tasks continue; a storage failure stops the run. Groups in the
-    envelope summarize stored selections without records.
+    An A-share runs the tasks of _collect_a_share; a US symbol runs the tasks of
+    _collect_us. Each task is saved before the next starts. A source failure lets
+    later tasks continue; a storage failure stops the run. Groups in the envelope
+    summarize stored selections without records.
 
     :param store: Store; open writable store.
     :param http: HttpClient; bounded client.
@@ -166,6 +167,44 @@ def collect(store: Store, http: HttpClient, request: CollectRequest, clock: UtcC
     started = time.monotonic()
     run = _Run(store, http, request, clock)
     symbol = request.symbol
+    links: tuple[CodeLink, ...] = ()
+    symbols: tuple[Symbol, ...] = (symbol,)
+    if symbol.exchange == "US":
+        _collect_us(run, symbol)
+    else:
+        links, symbols = _collect_a_share(run, symbol)
+    now = clock()
+    datasets: list[Group] = []
+    for query in _summary_queries(symbol, request.span):
+        page = store.query(query, now, symbols=symbols)
+        datasets.extend(page["groups"])
+    status = "partial" if _is_partial(run, datasets) else "ok"
+    component = {s.symbol_id for s in symbols}
+    used_links = [link for link in links if link.from_symbol.symbol_id in component]
+    stats = Stats(http_attempts=http.attempts, received_bytes=http.received_bytes, new_revisions=store.new_revisions,
+                  reused_revisions=store.reused_revisions, elapsed_seconds=f"{time.monotonic() - started:.3f}")
+    log_event(logging.INFO if status == "ok" else logging.WARNING, "collect_finished", run_id=run.run_id,
+              bytes=http.received_bytes)
+    return build_envelope("collect", status, symbol, symbols, used_links, request.span, run.run_id, datasets,
+                          _deduplicate(run.issues), stats, None)
+
+
+def _collect_a_share(run: _Run, symbol: Symbol) -> tuple[tuple[CodeLink, ...], tuple[Symbol, ...]]:
+    """Run the A-share tasks for one symbol and return the stored code links and the resolved symbols.
+
+    Order: Beijing code mapping (global daily check, Beijing symbols only), alias
+    resolution from verified links, then for the requested symbol and each alias:
+    raw and forward prices from Eastmoney (with a separate full-range Tencent task
+    when the whole Eastmoney task failed or returned no rows), Sina income, balance,
+    and cash-flow statements, filing discovery, and up to 24 filing documents
+    including PDF attachments.
+
+    :param run: _Run; run state.
+    :param symbol: Symbol; requested A-share symbol.
+    return outcome: tuple[tuple[CodeLink, ...], tuple[Symbol, ...]]; stored links, and the requested symbol
+        followed by its verified aliases.
+    """
+    store, http, request, clock = run.store, run.http, run.request, run.clock
     if symbol.exchange == "BJ":
         run.run_task(CheckKey(None, "bse", "mapping"), None, lambda: lookup_code_links(http, now=clock()))
     links = store.read_links()
@@ -193,20 +232,163 @@ def collect(store: Store, http: HttpClient, request: CollectRequest, clock: UtcC
     explicit = [replace(ref, verified_aliases=tuple(s for s in symbols if s != ref.symbol)) for ref in request.filings]
     _collect_documents(run, store.read_state(symbols), explicit + candidates)
     _report_parent_gaps(run, symbols, candidates)
-    now = clock()
-    datasets: list[Group] = []
-    for query in _summary_queries(symbol, request.span):
-        page = store.query(query, now, symbols=symbols)
-        datasets.extend(page["groups"])
-    status = "partial" if _is_partial(run, datasets) else "ok"
-    component = {s.symbol_id for s in symbols}
-    used_links = [link for link in links if link.from_symbol.symbol_id in component]
-    stats = Stats(http_attempts=http.attempts, received_bytes=http.received_bytes, new_revisions=store.new_revisions,
-                  reused_revisions=store.reused_revisions, elapsed_seconds=f"{time.monotonic() - started:.3f}")
-    log_event(logging.INFO if status == "ok" else logging.WARNING, "collect_finished", run_id=run.run_id,
-              bytes=http.received_bytes)
-    return build_envelope("collect", status, symbol, symbols, used_links, request.span, run.run_id, datasets,
-                          _deduplicate(run.issues), stats, None)
+    return links, symbols
+
+
+def _collect_us(run: _Run, symbol: Symbol) -> None:
+    """Run the US tasks for one symbol.
+
+    Order: the SEC ticker list (company number and exchange), the reported values,
+    unadjusted and forward-adjusted prices, and the report pages named by the
+    stored values. When the SEC lookup does not succeed, for example because the
+    SEC contact is not configured, the other SEC tasks are skipped and the price
+    tasks still run. Earlier tickers of a renamed company are not traced; the run
+    says so in a warning.
+
+    :param run: _Run; run state.
+    :param symbol: Symbol; requested US symbol.
+    return None: None; no value is returned.
+    """
+    state = run.store.read_state((symbol,))
+    company = _collect_sec_company(run, symbol)
+    cik = company.get("cik") if company.get("found") else None
+    if isinstance(cik, int):
+        run.run_task(CheckKey(symbol.symbol_id, "sec", "facts"), None,
+                     lambda: fetch_sec_facts(run.http, symbol, cik))
+    exchange = company.get("sec_exchange")
+    _collect_us_prices(run, state, symbol, exchange if isinstance(exchange, str) else None)
+    if isinstance(cik, int):
+        _collect_sec_reports(run, symbol, cik)
+    run.issues.append(make_issue("code_mapping_unresolved", "earlier tickers of this company are not traced, so"
+                                 " history under a former ticker is not collected", "mapping", severity="warning",
+                                 symbol=symbol))
+
+
+def _collect_sec_company(run: _Run, symbol: Symbol) -> dict[str, Any]:
+    """Look up the company of a US symbol in the SEC ticker list, or reuse today's lookup, and return its record.
+
+    Output: the metadata of a succeeded lookup (`found: bool`, `ticker: str`, and
+    when found `cik: int`, `name: str`, `sec_exchange: str | None`), or an empty
+    object when no lookup succeeded today. A lookup that failed earlier today is
+    not repeated without a refresh; the run then reports `sec_lookup_failed_today`.
+
+    :param run: _Run; run state.
+    :param symbol: Symbol; US symbol.
+    return company: dict[str, Any]; company record, or an empty object.
+    """
+    key = CheckKey(symbol.symbol_id, "sec", "mapping")
+    summary = run.run_task(key, None, lambda: lookup_sec_company(run.http, symbol))
+    if summary is None:
+        summary = _latest(run.store.read_state((symbol,)).checks, key)
+        if summary is not None and summary.state != "succeeded":
+            run.issues.append(make_issue("sec_lookup_failed_today", "the SEC company lookup failed earlier today, so"
+                                         " SEC data is not collected in this run; use --refresh to try again",
+                                         "mapping", symbol=symbol, provider="sec", retryable=True))
+    if summary is None or summary.state != "succeeded" or not isinstance(summary.metadata, dict):
+        return {}
+    return summary.metadata
+
+
+def _find_stored_venue(state: CacheState, symbol: Symbol) -> str | None:
+    """Find the Eastmoney venue number that an earlier price check stored for a US symbol and return it, or None.
+
+    :param state: CacheState; stored checks.
+    :param symbol: Symbol; US symbol.
+    return venue: str | None; venue number such as `105`, or None when no check stored one.
+    """
+    for check in sorted(state.checks, key=lambda c: c.check_id, reverse=True):
+        if check.key.symbol_id == symbol.symbol_id and check.key.dataset == "prices" \
+                and isinstance(check.metadata, dict) and check.metadata.get("venue"):
+            return str(check.metadata["venue"])
+    return None
+
+
+def _collect_us_prices(run: _Run, state: CacheState, symbol: Symbol, sec_exchange: str | None) -> None:
+    """Run the unadjusted and forward-adjusted price tasks for a US symbol, with the Tencent fallback when eligible.
+
+    Eastmoney tries a venue stored by an earlier check first, then the venues in
+    the order that the SEC exchange suggests. Tencent runs as a separate task only
+    for unadjusted prices, only when the Eastmoney task failed completely or
+    returned no rows, and only when the venue is known; it has no forward-adjusted
+    US prices.
+
+    :param run: _Run; run state.
+    :param state: CacheState; stored checks.
+    :param symbol: Symbol; US symbol.
+    :param sec_exchange: str | None; exchange from the SEC ticker list, such as `Nasdaq` or `NYSE`, or None.
+    return None: None; no value is returned.
+    """
+    today = compute_market_day(symbol.symbol_id, run.clock())
+    known = _find_stored_venue(state, symbol)
+    order = {"Nasdaq": ("105", "106", "107"), "NYSE": ("106", "107", "105")}.get(sec_exchange or "", US_VENUES)
+    for adjustment in ("raw", "forward"):
+        venues = tuple(dict.fromkeys(([known] if known else []) + list(order)))
+        key = CheckKey(symbol.symbol_id, "eastmoney", "prices", adjustment)
+        horizon = summarize_horizon(state.checks, key, run.request.span)
+        summary = run.run_task(key, horizon, lambda h=horizon, a=adjustment, v=venues: fetch_prices(
+            run.http, symbol, h, a, "eastmoney", today=today, venues=v))
+        if summary is None:
+            latest = _latest(run.store.read_state((symbol,)).checks, key)
+            summary = latest if latest and compute_market_day(symbol.symbol_id, latest.started_at) == today else None
+        if summary is None:
+            continue
+        if isinstance(summary.metadata, dict) and summary.metadata.get("venue"):
+            known = str(summary.metadata["venue"])
+        if summary.state != "failed" and summary.coverage.row_count > 0:
+            continue
+        if adjustment == "forward":
+            run.issues.append(make_issue("forward_fallback_unavailable", "Eastmoney returned no forward-adjusted"
+                                         " prices, and Tencent has none for US shares", "prices", severity="warning",
+                                         symbol=symbol, provider="tencent"))
+            continue
+        if known is None:
+            run.issues.append(make_issue("price_fallback_unavailable", "the Tencent fallback needs the venue that"
+                                         " Eastmoney confirms, and no venue is known", "prices", severity="warning",
+                                         symbol=symbol, provider="tencent"))
+            continue
+        tencent_key = CheckKey(symbol.symbol_id, "tencent", "prices", adjustment)
+        tencent_horizon = summarize_horizon(state.checks, tencent_key, horizon)
+        result = run.run_task(tencent_key, tencent_horizon, lambda h=tencent_horizon, v=known: fetch_prices(
+            run.http, symbol, h, "raw", "tencent", today=today, venues=(v,)))
+        if result is not None:
+            run.issues.append(make_issue("price_fallback_used", "Eastmoney unadjusted prices were unavailable;"
+                                         " Tencent was queried as a separate source", "prices", severity="warning",
+                                         symbol=symbol, provider="tencent"))
+
+
+def _collect_sec_reports(run: _Run, symbol: Symbol, cik: int) -> None:
+    """Read the statement pages of the periodic reports that the stored values name, newest report first.
+
+    A report is read when it was never read, when its last read failed, or on
+    refresh; a filed report does not change, so there is no later recheck. Before
+    each report the run must have at least four requests left. Reports beyond the
+    budget are recorded as pending work with the warning `work_limit`, and a
+    later run continues with them.
+
+    :param run: _Run; run state.
+    :param symbol: Symbol; US symbol.
+    :param cik: int; SEC company number.
+    return None: None; no value is returned.
+    """
+    planned = plan_sec_filings(run.store.list_fact_filings(symbol), symbol, cik, run.request.span)
+    state = run.store.read_state((symbol,))
+    pending: list[str] = []
+    for filing in planned:
+        key = CheckKey(symbol.symbol_id, "sec", "filing", "none", filing.reference.uri)
+        latest = _latest(state.checks, key)
+        if not run.request.refresh and latest is not None and latest.finished_at is not None \
+                and latest.state != "failed":
+            continue
+        if run.http.max_requests - run.http.attempts < SEC_REPORT_REQUESTS:
+            pending.append(filing.reference.uri)
+            continue
+        run.run_task(key, None, lambda f=filing: read_sec_filing(run.http, f))
+    if pending:
+        run.pending.extend(pending)
+        run.issues.append(make_issue("work_limit", f"{len(pending)} reports remain unread because the request"
+                                     " budget of this run is used up; run the command again to continue; first"
+                                     f" {pending[0]}", "filing", severity="warning", symbol=symbol, provider="sec",
+                                     retryable=True))
 
 
 def _collect_prices(run: _Run, state: CacheState, symbol: Symbol) -> None:
@@ -469,12 +651,16 @@ def _summary_queries(symbol: Symbol, span: DateRange) -> list[QueryRequest]:
 
     :param symbol: Symbol; requested symbol.
     :param span: DateRange; requested range.
-    return queries: list[QueryRequest]; raw prices, forward prices, statements, and filings with limit 0.
+    return queries: list[QueryRequest]; raw prices, forward prices, statements, and filings with limit 0,
+        and for a US symbol also the reported values.
     """
-    return [QueryRequest(symbol=symbol, span=span, dataset="prices", adjustment="raw", limit=0),
-            QueryRequest(symbol=symbol, span=span, dataset="prices", adjustment="forward", limit=0),
-            QueryRequest(symbol=symbol, span=span, dataset="statements", limit=0),
-            QueryRequest(symbol=symbol, span=span, dataset="filings", limit=0)]
+    queries = [QueryRequest(symbol=symbol, span=span, dataset="prices", adjustment="raw", limit=0),
+               QueryRequest(symbol=symbol, span=span, dataset="prices", adjustment="forward", limit=0),
+               QueryRequest(symbol=symbol, span=span, dataset="statements", limit=0),
+               QueryRequest(symbol=symbol, span=span, dataset="filings", limit=0)]
+    if symbol.exchange == "US":
+        queries.append(QueryRequest(symbol=symbol, span=span, dataset="facts", limit=0))
+    return queries
 
 
 def _is_partial(run: _Run, datasets: list[Group]) -> bool:
@@ -563,8 +749,11 @@ def build_envelope(command: str, status: str, symbol: Symbol | None, symbols: tu
     """Assemble the JSON command envelope from its parts and return it.
 
     Output schema: see `CommandResult` in providers.py and the DTD section "CLI and
-    JSON". `source_conditions_status` is always `unresolved` because provider reuse
-    conditions were not established.
+    JSON". `source_conditions_status` is `sec_free_to_access_and_reuse` when every
+    group of the envelope comes from the provider `sec`, because the SEC states
+    that its filing content is free to access and reuse. It is `unresolved` in
+    every other case, because the reuse conditions of the other providers were
+    not established.
 
     :param command: str; `collect` or `show`.
     :param status: str; `ok`, `partial`, or `error`.
@@ -579,13 +768,15 @@ def build_envelope(command: str, status: str, symbol: Symbol | None, symbols: tu
     :param pagination: Any; Pagination for show, None for collect.
     return envelope: CommandResult; JSON-ready envelope.
     """
+    providers = {group["provider"] for group in datasets}
+    conditions = "sec_free_to_access_and_reuse" if providers and providers <= {"sec"} else "unresolved"
     return CommandResult(
         schema_version=1, command=command, status=status,
         requested_symbol=symbol.symbol_id if symbol else None,
         resolved_symbols=[convert_to_json(s) for s in symbols],  # type: ignore[misc]
         code_links=[convert_to_json(link) for link in links],  # type: ignore[misc]
         requested_range=convert_to_json(span) if span else None,  # type: ignore[typeddict-item]
-        run_id=run_id, source_conditions_status="unresolved", datasets=datasets,
+        run_id=run_id, source_conditions_status=conditions, datasets=datasets,
         issues=[convert_to_json(i) if isinstance(i, Issue) else i for i in issues],  # type: ignore[misc]
         stats=stats, pagination=pagination)
 
